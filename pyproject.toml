@@ -1,0 +1,23 @@
+[project]
+name = "elec-auto"
+version = "0.1.0"
+description = "Home energy automation: route surplus PV power to battery, EV, or grid per priority policy"
+readme = "README.md"
+authors = [
+    { name = "Ian Schillebeeckx", email = "ianschillebeeckx@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "loguru>=0.7.3",
+    "pydantic-settings>=2.14.0",
+    "pyemvue>=0.18.9",
+    "pypowerwall>=0.15.3",
+    "typer>=0.24.1",
+]
+
+[project.scripts]
+elec-auto = "elec_auto:main"
+
+[build-system]
+requires = ["uv_build>=0.11.7,<0.12.0"]
+build-backend = "uv_build"
