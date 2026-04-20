@@ -28,14 +28,17 @@ def probe() -> None:
 
     try:
         em = Emporia(settings)
-        chargers = em.list_chargers()
-        logger.info("emporia: found {} charger(s)", len(chargers))
-        for c in chargers:
+        devices = em.list_chargers()
+        logger.info("emporia: found {} charger(s)", len(devices))
+        for d in devices:
+            c = d.ev_charger
             logger.info(
-                "  gid={} name={!r} on={} rate={}A max={}A",
-                c.device_gid, c.name, c.charger_on, c.charging_rate, c.max_charging_rate,
+                "  gid={} name={!r} on={} rate={}A max={}A status={!r} msg={!r}",
+                d.device_gid, d.device_name or d.display_name,
+                c.charger_on, c.charging_rate, c.max_charging_rate,
+                c.status, c.message,
             )
-        ev = em.read() if chargers else None
+        ev = em.read() if devices else None
     except Exception as e:
         logger.warning("emporia read failed: {}", e)
         ev = None

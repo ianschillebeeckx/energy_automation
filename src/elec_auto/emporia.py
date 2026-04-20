@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from pyemvue import PyEmVue
-from pyemvue.device import ChargerDevice
+from pyemvue.device import ChargerDevice, VueDevice
 
 from .config import Settings
 
@@ -30,49 +30,43 @@ class Emporia:
         )
         self._evse_gid = settings.emporia_evse_gid
 
-    def list_chargers(self) -> list[ChargerDevice]:
-        return [
-            d.ev_charger
-            for d in self._vue.get_devices()
-            if d.ev_charger is not None
-        ]
+    def _charger_devices(self) -> list[VueDevice]:
+        return [d for d in self._vue.get_devices() if d.ev_charger is not None]
 
-    def _charger(self) -> ChargerDevice:
-        chargers = self.list_chargers()
-        if not chargers:
+    def list_chargers(self) -> list[VueDevice]:
+        return self._charger_devices()
+
+    def _select(self) -> VueDevice:
+        devices = self._charger_devices()
+        if not devices:
             raise RuntimeError("No EV chargers found on Emporia account")
         if self._evse_gid is None:
-            if len(chargers) > 1:
+            if len(devices) > 1:
                 raise RuntimeError(
                     "Multiple chargers found; set EMPORIA_EVSE_GID in .env"
                 )
-            return chargers[0]
-        for c in chargers:
-            if c.device_gid == self._evse_gid:
-                return c
+            return devices[0]
+        for d in devices:
+            if d.device_gid == self._evse_gid:
+                return d
         raise RuntimeError(f"Charger with gid={self._evse_gid} not found")
 
-    def read(self) -> ChargerState:
-        c = self._charger()
+    @staticmethod
+    def _state(parent: VueDevice, charger: ChargerDevice) -> ChargerState:
         return ChargerState(
-            gid=c.device_gid,
-            name=c.name or "EV Charger",
-            on=bool(c.charger_on),
-            charge_rate_a=int(c.charging_rate),
-            max_charge_rate_a=int(c.max_charging_rate),
+            gid=parent.device_gid,
+            name=parent.device_name or parent.display_name or "EV Charger",
+            on=bool(charger.charger_on),
+            charge_rate_a=int(charger.charging_rate),
+            max_charge_rate_a=int(charger.max_charging_rate),
         )
+
+    def read(self) -> ChargerState:
+        parent = self._select()
+        return self._state(parent, parent.ev_charger)
 
     def set_amps(self, amps: int, *, on: bool | None = None) -> ChargerState:
         """Set charge current (A). If `on` is None, leave on/off state unchanged."""
-        c = self._charger()
-        c.charging_rate = amps
-        if on is not None:
-            c.charger_on = on
-        updated = self._vue.update_charger(c)
-        return ChargerState(
-            gid=updated.device_gid,
-            name=updated.name or "EV Charger",
-            on=bool(updated.charger_on),
-            charge_rate_a=int(updated.charging_rate),
-            max_charge_rate_a=int(updated.max_charging_rate),
-        )
+        parent = self._select()
+        updated = self._vue.update_charger(parent.ev_charger, on=on, charge_rate=amps)
+        return self._state(parent, updated)

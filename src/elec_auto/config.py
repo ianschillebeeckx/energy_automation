@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from pydantic import Field
+from typing import Literal
+
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -13,9 +15,20 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Tesla Powerwall 3 (local Gateway / TEDAPI)
+    # Tesla Powerwall 3
+    # "cloud" = Tesla Owner API via pypowerwall cloudmode (OAuth, needs one-time setup)
+    # "local" = Local TEDAPI on the Gateway (needs the Gateway password from sticker)
+    powerwall_mode: Literal["cloud", "local"] = "cloud"
+
+    # Cloud mode
+    tesla_email: str | None = None
+    tesla_site_id: int | None = None  # required only if account has multiple sites
+    # Directory holding pypowerwall's OAuth token cache (relative to project root).
+    powerwall_auth_path: str = "state"
+
+    # Local mode (TEDAPI)
     powerwall_host: str | None = None
-    powerwall_password: str | None = None
+    powerwall_gw_password: str | None = None
     powerwall_gw_serial: str | None = None
 
     # Emporia (cloud)
@@ -29,6 +42,17 @@ class Settings(BaseSettings):
     ev_min_amps: int = Field(default=6, ge=6)
     ev_max_amps: int = Field(default=40, ge=6)
     ev_voltage: int = 240
+
+    # Time zone passed to pypowerwall for timestamp handling.
+    timezone: str = "America/Los_Angeles"
+
+    @field_validator("tesla_site_id", "emporia_evse_gid", mode="before")
+    @classmethod
+    def _empty_str_to_none(cls, v: object) -> object:
+        # Blank values in .env (`FOO=`) arrive as "" — treat as unset.
+        if isinstance(v, str) and v.strip() == "":
+            return None
+        return v
 
 
 settings = Settings()

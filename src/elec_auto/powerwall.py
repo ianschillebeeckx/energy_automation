@@ -1,13 +1,20 @@
-"""Tesla Powerwall 3 local client.
+"""Tesla Powerwall 3 client.
 
-Powerwall 3 does not expose the legacy local web API that PW2 did. Access goes
-through TEDAPI (Tesla Energy Device API) on the Gateway. `pypowerwall` handles
-the TEDAPI handshake when given the Gateway password.
+Two backends, selected by `POWERWALL_MODE`:
+
+- **cloud**: Tesla Owner API via `pypowerwall` cloud mode. Works without any
+  physical access to the Gateway. One-time OAuth setup via
+  `uv run python -m pypowerwall -authpath state setup`.
+- **local**: Local TEDAPI on the Gateway. Needs the Gateway password (printed
+  on the sticker inside the front cover of the PW3). Lower latency, no cloud
+  dependency.
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from pathlib import Path
 
 import pypowerwall
 
@@ -34,13 +41,38 @@ class PowerReading:
 
 class Powerwall:
     def __init__(self, settings: Settings) -> None:
-        if not settings.powerwall_host:
-            raise RuntimeError("POWERWALL_HOST is not set in .env")
-        self._pw = pypowerwall.Powerwall(
-            host=settings.powerwall_host,
-            password=settings.powerwall_password or "",
-            gw_pwd=settings.powerwall_password or "",
-        )
+        self._settings = settings
+        auth_dir = Path(settings.powerwall_auth_path).resolve()
+        auth_dir.mkdir(parents=True, exist_ok=True)
+
+        if settings.powerwall_mode == "cloud":
+            if not settings.tesla_email:
+                raise RuntimeError(
+                    "cloud mode requires TESLA_EMAIL in .env and a one-time "
+                    "`uv run python -m pypowerwall -authpath state setup`."
+                )
+            self._pw = pypowerwall.Powerwall(
+                host="",
+                password="",
+                email=settings.tesla_email,
+                timezone=settings.timezone,
+                cloudmode=True,
+                siteid=settings.tesla_site_id,
+                authpath=str(auth_dir),
+            )
+        else:  # local TEDAPI
+            if not (settings.powerwall_host and settings.powerwall_gw_password):
+                raise RuntimeError(
+                    "local mode requires POWERWALL_HOST and POWERWALL_GW_PASSWORD."
+                )
+            self._pw = pypowerwall.Powerwall(
+                host=settings.powerwall_host,
+                password="",
+                email=settings.tesla_email or "nobody@nowhere.com",
+                timezone=settings.timezone,
+                gw_pwd=settings.powerwall_gw_password,
+                authpath=str(auth_dir),
+            )
 
     def read(self) -> PowerReading:
         p = self._pw.power() or {}
