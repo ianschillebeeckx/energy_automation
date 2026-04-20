@@ -55,5 +55,16 @@ def run() -> None:
     raise typer.Exit(code=1)
 
 
+@app.command()
+def serve(
+    host: str = typer.Option("127.0.0.1", help="Bind address; keep localhost unless you add auth."),
+    port: int = typer.Option(8000, help="Port for the web UI."),
+) -> None:
+    """Start the browser UI for manual charger control + live state."""
+    from .web import serve as _serve
+
+    _serve(host=host, port=port)
+
+
 def main() -> None:
     app()
