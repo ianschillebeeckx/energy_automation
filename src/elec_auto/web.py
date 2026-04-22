@@ -568,7 +568,6 @@ def _render(flash: str = "", flash_ok: bool = True, demo: str = "") -> str:
   .flash.err {{ background: #c331; color: var(--err); }}
   .err {{ color: var(--err); }}
 </style></head><body>
-<h1>elec_auto</h1>
 <p class="sub">{now} &middot; auto-refresh 15s</p>
 {flash_html}
 
