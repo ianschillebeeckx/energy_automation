@@ -65,6 +65,63 @@ def _safe_top_consumers(n: int = 3) -> list[tuple[str, float]] | None:
         return None
 
 
+def _demo_state(scenario: str) -> tuple[PowerReading, ChargerState, list[tuple[str, float]]]:
+    if scenario in ("export", "4"):
+        # Battery full, no EV draw, solar covers the modest home load and
+        # the rest flows out to the grid.
+        pw = PowerReading(
+            solar_w=6000, load_w=600, battery_w=0, grid_w=-5400, battery_soc_pct=100,
+        )
+        ev = ChargerState(
+            gid=0, name="Demo EV", on=True,
+            charge_rate_a=40, max_charge_rate_a=40, status="Standby",
+        )
+        consumers = [("HVAC", 400), ("Fridge", 120), ("Water Heater", 80)]
+        return pw, ev, consumers
+
+    if scenario in ("surplus", "3"):
+        # Battery full, excess solar diverts to EV (the project's core goal).
+        # Solar 6 kW covers a 480 W base load + 5520 W (23 A × 240 V) for
+        # the car, with zero battery flow and zero grid.
+        pw = PowerReading(
+            solar_w=6000, load_w=6000, battery_w=0, grid_w=0, battery_soc_pct=98,
+        )
+        ev = ChargerState(
+            gid=0, name="Demo EV", on=True,
+            charge_rate_a=23, max_charge_rate_a=40, status="Charging",
+        )
+        consumers = [("Water Heater", 200), ("Internet & Garage Plugs", 200), ("Fridge", 80)]
+        return pw, ev, consumers
+
+    if scenario in ("sunny", "2"):
+        # Solar at its 6 kW ceiling, covering a 3 kW house and pushing the
+        # remaining 3 kW into the battery. No grid, no car.
+        pw = PowerReading(
+            solar_w=6000, load_w=3000, battery_w=-3000, grid_w=0, battery_soc_pct=68,
+        )
+        ev = ChargerState(
+            gid=0, name="Demo EV", on=True,
+            charge_rate_a=40, max_charge_rate_a=40, status="Standby",
+        )
+        consumers = [("HVAC", 1800), ("Fridge", 600), ("Water Heater", 400)]
+        return pw, ev, consumers
+
+    # Default "peak": worst-case draw. The PW3 inverter caps AC output at
+    # 11.5 kW combined (solar + battery), so with solar at its 6 kW ceiling
+    # the battery can only supply the remaining 5.5 kW. House draws oven
+    # 3.8 + HVAC 3.6 + water heater 0.4 + EV 9.6 = 17.4 kW, so the grid
+    # covers the balance: 17.4 − 11.5 = 5.9 kW import.
+    pw = PowerReading(
+        solar_w=6000, load_w=17400, battery_w=5500, grid_w=5900, battery_soc_pct=55,
+    )
+    ev = ChargerState(
+        gid=0, name="Demo EV", on=True,
+        charge_rate_a=40, max_charge_rate_a=40, status="Charging",
+    )
+    consumers = [("Oven", 3800), ("HVAC", 3600), ("Water Heater", 400)]
+    return pw, ev, consumers
+
+
 # Node geometry for the flow SVG. Anchor points are on the box edges so arrows
 # terminate flush against them.
 _NODES = {
@@ -137,7 +194,7 @@ def _clip_to_node(sx: float, sy: float, ex: float, ey: float,
 def _edge_watts(src: str, dst: str, flows: Flows | None, ev: ChargerState | None) -> float:
     # Home -> car is a sub-flow of home's total load, not a meter edge.
     if src == "home" and dst == "car":
-        if ev is None or not ev.on:
+        if ev is None or not ev.charging:
             return 0.0
         return ev.charge_rate_a * settings.ev_voltage
     if flows is None:
@@ -150,7 +207,9 @@ def _node_value_label(name: str, pw: PowerReading | None, ev: ChargerState | Non
         if ev is None:
             return "—"
         if not ev.on:
-            return "idle"
+            return "disabled"
+        if not ev.charging:
+            return f"{ev.status.lower() or 'idle'} &middot; ready {ev.charge_rate_a} A"
         kw = ev.charge_rate_a * settings.ev_voltage / 1000
         return f"{kw:.1f} kW &middot; {ev.charge_rate_a} A"
     if pw is None:
@@ -207,6 +266,13 @@ def _flow_svg(
         f'<path d="M0,0 L10,5 L0,10 z" fill="{n["color"]}"/></marker>'
         for name, n in _NODES.items()
     )
+    # Clip path for the battery SoC fill, respects the box's rounded corners.
+    bn = _NODES["battery"]
+    battery_clip = (
+        '<clipPath id="node-battery-clip">'
+        f'<rect x="{bn["x"]}" y="{bn["y"]}" width="{bn["w"]}" height="{bn["h"]}" rx="10"/>'
+        '</clipPath>'
+    )
 
     edges = []
     for src, dst, (sx, sy), (ex, ey), (lx, ly) in _EDGES:
@@ -215,11 +281,20 @@ def _flow_svg(
         color = _NODES[src]["color"]
         opacity = 1.0 if active else 0.12
         cx, cy = _clip_to_node(sx, sy, ex, ey, _NODES[dst])
+        dash = ' stroke-dasharray="8 6"' if active else ""
+        # Decreasing dashoffset shifts the pattern forward along the line —
+        # faster dots for heavier flows, clamped so tiny flows still tick.
+        dur = max(0.375, min(1.875, 1875.0 / max(w, 800.0))) if active else 0
+        anim = (
+            f'<animate attributeName="stroke-dashoffset" values="14;0" '
+            f'dur="{dur:.1f}s" repeatCount="indefinite"/>'
+            if active else ""
+        )
         edges.append(
             f'<line x1="{sx}" y1="{sy}" x2="{cx:.1f}" y2="{cy:.1f}" '
             f'stroke="{color}" stroke-width="{_STROKE_W}" '
-            f'stroke-linecap="round" opacity="{opacity:.2f}" '
-            f'marker-end="url(#arrow-{src})"/>'
+            f'stroke-linecap="round" opacity="{opacity:.2f}"'
+            f'{dash} marker-end="url(#arrow-{src})">{anim}</line>'
         )
         if active:
             edges.append(
@@ -232,9 +307,18 @@ def _flow_svg(
         cx = n["x"] + n["w"] // 2
         title_y = n["y"] + 26
         value_y = n["y"] + 46
+        fill = ""
+        if name == "battery" and pw is not None and not math.isnan(pw.battery_soc_pct):
+            soc = max(0.0, min(100.0, pw.battery_soc_pct))
+            fill_w = n["w"] * soc / 100.0
+            fill = (
+                f'<rect x="{n["x"]}" y="{n["y"]}" width="{fill_w:.1f}" height="{n["h"]}" '
+                f'fill="{n["color"]}" fill-opacity="0.22" clip-path="url(#node-battery-clip)"/>'
+            )
         nodes.append(
             f'<g><rect x="{n["x"]}" y="{n["y"]}" width="{n["w"]}" height="{n["h"]}" '
             f'rx="10" fill="var(--node-bg)" stroke="{n["color"]}" stroke-width="2"/>'
+            f'{fill}'
             f'<text x="{cx}" y="{title_y}" text-anchor="middle" class="node-title">'
             f'{name.capitalize()}</text>'
             f'<text x="{cx}" y="{value_y}" text-anchor="middle" class="node-value">'
@@ -244,7 +328,7 @@ def _flow_svg(
     return (
         f'<svg viewBox="0 0 {_VIEWBOX_W} {_VIEWBOX_H}" class="flow" '
         'xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Power flow diagram">'
-        f'<defs>{markers}</defs>'
+        f'<defs>{markers}{battery_clip}</defs>'
         + "".join(edges)
         + "".join(nodes)
         + _consumer_rows(consumers)
@@ -252,10 +336,14 @@ def _flow_svg(
     )
 
 
-def _render(flash: str = "", flash_ok: bool = True) -> str:
-    pw, pw_err = _safe_pw()
-    ev, ev_err = _safe_em()
-    consumers = _safe_top_consumers()
+def _render(flash: str = "", flash_ok: bool = True, demo: str = "") -> str:
+    if demo:
+        pw, ev, consumers = _demo_state(demo)
+        pw_err = ev_err = None
+    else:
+        pw, pw_err = _safe_pw()
+        ev, ev_err = _safe_em()
+        consumers = _safe_top_consumers()
     decision: Decision | None = None
     if pw is not None and ev is not None:
         try:
@@ -364,8 +452,8 @@ def _render(flash: str = "", flash_ok: bool = True) -> str:
 
 
 @app.get("/", response_class=HTMLResponse)
-def index() -> str:
-    return _render()
+def index(demo: str = "") -> str:
+    return _render(demo=demo)
 
 
 @app.post("/set")

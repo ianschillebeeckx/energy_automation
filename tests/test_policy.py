@@ -34,10 +34,11 @@ def _pw(*, solar=0.0, load=0.0, soc=85.0, battery=0.0, grid=0.0) -> PowerReading
     )
 
 
-def _ev(*, on=False, rate=0, maxrate=40) -> ChargerState:
+def _ev(*, on=False, rate=0, maxrate=40, status="Standby") -> ChargerState:
     return ChargerState(
         gid=1, name="test", on=on,
         charge_rate_a=rate, max_charge_rate_a=maxrate,
+        status=status,
     )
 
 

@@ -32,6 +32,12 @@ class ChargerState:
     on: bool
     charge_rate_a: int
     max_charge_rate_a: int
+    # EVSE-reported operational state: "Standby", "Charging", "Disconnected"...
+    status: str
+
+    @property
+    def charging(self) -> bool:
+        return self.on and self.status.lower() == "charging"
 
 
 class Emporia:
@@ -74,6 +80,7 @@ class Emporia:
             on=bool(charger.charger_on),
             charge_rate_a=int(charger.charging_rate),
             max_charge_rate_a=int(charger.max_charging_rate),
+            status=str(charger.status or ""),
         )
 
     def read(self) -> ChargerState:
