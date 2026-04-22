@@ -57,12 +57,14 @@ def run() -> None:
 
 @app.command()
 def serve(
-    host: str = typer.Option("127.0.0.1", help="Bind address; keep localhost unless you add auth."),
+    host: str = typer.Option("0.0.0.0", help="Bind address. Default exposes to LAN; no auth — keep off untrusted networks."),
     port: int = typer.Option(8000, help="Port for the web UI."),
 ) -> None:
     """Start the browser UI for manual charger control + live state."""
     from .web import serve as _serve
 
+    if host == "0.0.0.0":
+        logger.warning("serving on 0.0.0.0:{} with NO AUTH — LAN-only, no reverse proxy", port)
     _serve(host=host, port=port)
 
 
