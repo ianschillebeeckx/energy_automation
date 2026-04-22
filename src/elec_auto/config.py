@@ -43,6 +43,16 @@ class Settings(BaseSettings):
     ev_max_amps: int = Field(default=40, ge=6)
     ev_voltage: int = 240
 
+    # Powerwall usable capacity (kWh). One PW3 unit is 13.5 kWh; override
+    # in .env if the site has more. Used by the morning-dump calculator.
+    battery_capacity_kwh: float = 13.5
+    # Morning-dump floor SoC and window (hours) the dump should finish in.
+    morning_dump_floor_pct: int = Field(default=15, ge=5, le=95)
+    morning_dump_hours: float = 1.0
+    morning_dump_start_hour: int = Field(default=7, ge=0, le=23)
+    # Trickle mode fixed rate.
+    trickle_kw: float = 2.0
+
     # Time zone passed to pypowerwall for timestamp handling.
     timezone: str = "America/Los_Angeles"
 

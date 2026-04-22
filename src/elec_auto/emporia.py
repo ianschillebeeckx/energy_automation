@@ -93,6 +93,17 @@ class Emporia:
         updated = self._vue.update_charger(parent.ev_charger, on=on, charge_rate=amps)
         return self._state(parent, updated)
 
+    def set_on(self, on: bool) -> ChargerState:
+        """Toggle the charger on/off without changing the configured amperage.
+
+        Useful when the controller wants to pause charging (e.g. outside a
+        scheduled window) but preserve the rate the user set via the dashboard
+        for when it resumes.
+        """
+        parent = self._select()
+        updated = self._vue.update_charger(parent.ev_charger, on=on)
+        return self._state(parent, updated)
+
     def top_consumers(self, n: int = 3) -> list[tuple[str, float]]:
         """Return top-N named circuits by instantaneous power draw, in watts.
 

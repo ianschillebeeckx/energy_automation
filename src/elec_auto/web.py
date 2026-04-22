@@ -6,8 +6,10 @@ open LAN without putting a reverse proxy / password in front of it.
 
 from __future__ import annotations
 
+import asyncio
 import html
 import math
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Annotated
 
@@ -16,15 +18,41 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from loguru import logger
 
 from .config import settings
+from .controller import compute_target
 from .emporia import ChargerState, Emporia
 from .flow import Flows, decompose
-from .policy import Decision, decide_ev_amps
+from .policy import Decision
 from .powerwall import Powerwall, PowerReading
 
-app = FastAPI(title="elec_auto", docs_url=None, redoc_url=None)
+
+@asynccontextmanager
+async def _lifespan(app_: FastAPI):
+    loop = asyncio.get_running_loop()
+    task = loop.create_task(_control_loop())
+    logger.info("control loop started (mode={}, interval={}s)",
+                _charge_mode, settings.poll_interval_sec)
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(title="elec_auto", docs_url=None, redoc_url=None, lifespan=_lifespan)
 
 _pw: Powerwall | None = None
 _em: Emporia | None = None
+
+_CHARGE_MODES: dict[str, str] = {
+    "surplus":      "Surplus solar",
+    "morning_dump": "Morning dump",
+    "trickle":      f"Trickle ({settings.trickle_kw:.0f} kW)",
+    "off":          "Off",
+}
+_charge_mode: str = "surplus"
 
 
 def _powerwall() -> Powerwall:
@@ -63,6 +91,132 @@ def _safe_top_consumers(n: int = 3) -> list[tuple[str, float]] | None:
     except Exception:
         logger.exception("emporia top_consumers failed")
         return None
+
+
+def _next_dump_start(s) -> datetime:
+    """Wall-clock moment when the next morning-dump window opens."""
+    from zoneinfo import ZoneInfo
+
+    from .controller import _next_dump_window
+    return _next_dump_window(datetime.now(ZoneInfo(s.timezone)), s)[0]
+
+
+def _apply_target(decision: Decision) -> None:
+    """Push a target decision to the EVSE.
+
+    If the controller wants the charger on, push (amps, on=True). If it
+    wants off but we still have a preview amperage (e.g. scheduled
+    morning_dump), push (amps, on=False) so the dashboard reflects the
+    intended rate. If there's no meaningful rate, just flip the switch
+    off and leave whatever amperage the user configured manually.
+    """
+    try:
+        em = _emporia()
+    except Exception:
+        logger.exception("apply: emporia init failed")
+        return
+    try:
+        if decision.on:
+            em.set_amps(decision.target_amps, on=True)
+            logger.info("apply: mode={} set {} A on ({})",
+                        _charge_mode, decision.target_amps, decision.reason)
+        elif decision.target_amps >= settings.ev_min_amps:
+            em.set_amps(decision.target_amps, on=False)
+            logger.info("apply: mode={} set {} A off ({})",
+                        _charge_mode, decision.target_amps, decision.reason)
+        else:
+            em.set_on(False)
+            logger.info("apply: mode={} off ({})", _charge_mode, decision.reason)
+    except Exception:
+        logger.exception("apply: push to EVSE failed")
+
+
+def _control_tick() -> None:
+    pw, _ = _safe_pw()
+    ev, _ = _safe_em()
+    decision = compute_target(_charge_mode, pw, ev, settings)
+    if ev is None:
+        return
+    has_rate = decision.target_amps >= settings.ev_min_amps
+    # Skip the network write when the EVSE already matches the target.
+    if decision.on:
+        if ev.on and has_rate and ev.charge_rate_a == decision.target_amps:
+            return
+    else:
+        if not ev.on and (not has_rate or ev.charge_rate_a == decision.target_amps):
+            return
+    _apply_target(decision)
+
+
+async def _control_loop() -> None:
+    loop = asyncio.get_running_loop()
+    while True:
+        try:
+            await loop.run_in_executor(None, _control_tick)
+        except Exception:
+            logger.exception("control loop tick failed")
+        await asyncio.sleep(settings.poll_interval_sec)
+
+
+_FO_NS = 'xmlns="http://www.w3.org/1999/xhtml"'
+
+# Right-column panel geometry — same coordinate system as the SVG nodes.
+_PANEL_X = 640
+_PANEL_W = 210
+_LOADS_PANEL = (_PANEL_X, 150, _PANEL_W, 120)   # aligns with Home (y=180..240)
+_MODES_PANEL = (_PANEL_X, 270, _PANEL_W, 180)   # aligns with Car  (y=340..400), tall enough for 4 buttons
+
+
+def _loads_foreign(consumers: list[tuple[str, float]] | None) -> str:
+    if consumers is None:
+        body = '<li class="muted">—</li>'
+    elif not consumers:
+        body = '<li class="muted">all idle</li>'
+    else:
+        body = "".join(
+            f'<li>{html.escape(name)}<span>{watts:.0f} W</span></li>'
+            for name, watts in consumers
+        )
+    x, y, w, h = _LOADS_PANEL
+    return (
+        f'<foreignObject x="{x}" y="{y}" width="{w}" height="{h}">'
+        f'<div {_FO_NS} class="panel"><h3>Top loads</h3>'
+        f'<ul class="loads">{body}</ul></div></foreignObject>'
+    )
+
+
+def _modes_foreign(pw: PowerReading | None, ev: ChargerState | None) -> str:
+    rows = []
+    for key, label in _CHARGE_MODES.items():
+        cls = "mode-btn active" if key == _charge_mode else "mode-btn"
+        hint = ""
+        if key == "trickle":
+            d = compute_target(key, pw, None, settings)
+            hint = f'<small>&rarr; {d.target_amps} A</small>'
+        elif key == "surplus":
+            d = compute_target(key, pw, ev, settings)
+            if d.target_amps:
+                hint = f'<small>&rarr; {d.target_amps} A</small>'
+            else:
+                hint = f'<small>{html.escape(d.reason)}</small>'
+        elif key == "morning_dump":
+            preview_now = _next_dump_start(settings)
+            d = compute_target(key, pw, None, settings, now=preview_now)
+            if d.target_amps:
+                hint = f'<small>{preview_now:%H:%M} &rarr; {d.target_amps} A</small>'
+            else:
+                hint = f'<small>{html.escape(d.reason)}</small>'
+        rows.append(
+            f'<button type="submit" name="mode" value="{key}" class="{cls}">'
+            f'{label}{hint}</button>'
+        )
+    x, y, w, h = _MODES_PANEL
+    return (
+        f'<foreignObject x="{x}" y="{y}" width="{w}" height="{h}">'
+        f'<div {_FO_NS} class="panel"><h3>Charge mode</h3>'
+        f'<form method="post" action="/mode">' + "".join(rows) +
+        '</form></div></foreignObject>'
+    )
 
 
 def _demo_state(scenario: str) -> tuple[PowerReading, ChargerState, list[tuple[str, float]]]:
@@ -143,10 +297,12 @@ _EDGES: list[tuple[str, str, tuple[int, int], tuple[int, int], tuple[int, int]]]
     ("home",    "car",     (560, 240), (560, 340), (585, 295)),
 ]
 
-# Viewbox extends right of Home node to fit the top-consumers list.
-_VIEWBOX_W = 820
-_VIEWBOX_H = 420
-_CONSUMERS_X = 650  # left edge of the consumer list column
+# Viewbox reserves a 210-unit column to the right of the five nodes for the
+# Top-loads and Charge-mode panels (embedded via foreignObject so they sit
+# exactly beside Home and Car respectively). 40 extra vertical units give
+# the charge-mode form room to extend below the car node.
+_VIEWBOX_W = 860
+_VIEWBOX_H = 460
 
 # Minimum watts to draw an edge at full opacity (below this it's a ghost line).
 _FLOW_VISIBLE_W = 50.0
@@ -207,7 +363,7 @@ def _node_value_label(name: str, pw: PowerReading | None, ev: ChargerState | Non
         if ev is None:
             return "—"
         if not ev.on:
-            return "disabled"
+            return f"disabled &middot; ready {ev.charge_rate_a} A"
         if not ev.charging:
             return f"{ev.status.lower() or 'idle'} &middot; ready {ev.charge_rate_a} A"
         kw = ev.charge_rate_a * settings.ev_voltage / 1000
@@ -230,32 +386,10 @@ def _node_value_label(name: str, pw: PowerReading | None, ev: ChargerState | Non
     return ""
 
 
-def _consumer_rows(consumers: list[tuple[str, float]] | None) -> str:
-    header = (
-        f'<text x="{_CONSUMERS_X}" y="190" class="consumers-head" '
-        f'fill="var(--muted)">Top loads</text>'
-    )
-    if not consumers:
-        note = "—" if consumers is None else "all idle"
-        return header + (
-            f'<text x="{_CONSUMERS_X}" y="215" class="consumer-row" '
-            f'fill="var(--muted)">{note}</text>'
-        )
-    rows = [header]
-    for i, (name, watts) in enumerate(consumers):
-        y = 215 + i * 22
-        rows.append(
-            f'<text x="{_CONSUMERS_X}" y="{y}" class="consumer-row">'
-            f'{html.escape(name)}'
-            f'<tspan class="consumer-watts" dx="8">{watts:.0f} W</tspan></text>'
-        )
-    return "".join(rows)
-
-
 def _flow_svg(
     pw: PowerReading | None,
-    consumers: list[tuple[str, float]] | None = None,
     ev: ChargerState | None = None,
+    consumers: list[tuple[str, float]] | None = None,
 ) -> str:
     flows = decompose(pw) if pw is not None else None
 
@@ -331,7 +465,8 @@ def _flow_svg(
         f'<defs>{markers}{battery_clip}</defs>'
         + "".join(edges)
         + "".join(nodes)
-        + _consumer_rows(consumers)
+        + _loads_foreign(consumers)
+        + _modes_foreign(pw, ev)
         + "</svg>"
     )
 
@@ -344,13 +479,11 @@ def _render(flash: str = "", flash_ok: bool = True, demo: str = "") -> str:
         pw, pw_err = _safe_pw()
         ev, ev_err = _safe_em()
         consumers = _safe_top_consumers()
-    decision: Decision | None = None
-    if pw is not None and ev is not None:
-        try:
-            decision = decide_ev_amps(pw, ev, settings)
-        except Exception as e:
-            logger.exception("policy decide failed")
-            decision = Decision(0, f"policy error: {e}")
+    try:
+        decision = compute_target(_charge_mode, pw, ev, settings)
+    except Exception as e:
+        logger.exception("compute_target failed")
+        decision = Decision(0, f"policy error: {e}")
 
     def fmt_w(v: float) -> str:
         return f"{v:+.0f} W" if v else "0 W"
@@ -381,9 +514,8 @@ def _render(flash: str = "", flash_ok: bool = True, demo: str = "") -> str:
         ev_rows = f"<tr><td colspan=2 class=err>Emporia unavailable: {html.escape(ev_err or '')}</td></tr>"
 
     decision_html = (
-        f"<p class=decision><b>Policy would set:</b> {decision.target_amps} A <small>({html.escape(decision.reason)})</small></p>"
-        if decision is not None
-        else ""
+        f'<p class=decision><b>{html.escape(_CHARGE_MODES[_charge_mode])}:</b> '
+        f'{decision.target_amps} A <small>({html.escape(decision.reason)})</small></p>'
     )
 
     flash_html = ""
@@ -400,15 +532,25 @@ def _render(flash: str = "", flash_ok: bool = True, demo: str = "") -> str:
 <title>elec_auto</title>
 <style>
   :root {{ color-scheme: light dark; --muted:#888; --ok:#2a7; --err:#c33; }}
-  body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 860px; margin: 2em auto; padding: 0 1em; --node-bg: #fff; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 900px; margin: 2em auto; padding: 0 1em; --node-bg: #fff; }}
   @media (prefers-color-scheme: dark) {{ body {{ --node-bg: #1a1a1a; }} }}
-  svg.flow {{ width: 100%; height: auto; max-width: 820px; display: block; margin: .5em auto 1.5em; }}
+  svg.flow {{ width: 100%; height: auto; max-width: 860px; display: block; margin: .5em auto 1.5em; }}
   svg.flow .node-title {{ font-size: 14px; font-weight: 600; fill: currentColor; }}
   svg.flow .node-value {{ font-size: 12px; fill: var(--muted); }}
   svg.flow .flow-label {{ font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; paint-order: stroke; stroke: var(--node-bg); stroke-width: 3px; }}
-  svg.flow .consumers-head {{ font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; }}
-  svg.flow .consumer-row {{ font-size: 13px; fill: currentColor; }}
-  svg.flow .consumer-watts {{ fill: var(--muted); font-variant-numeric: tabular-nums; }}
+  /* Panels embedded in the SVG via <foreignObject>. They use the same
+     coordinate system as the nodes so they stay aligned at every zoom. */
+  svg.flow .panel {{ font-size: 12px; color: currentColor; }}
+  svg.flow .panel h3 {{ font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 .4em 0; }}
+  svg.flow .panel ul.loads {{ list-style: none; padding: 0; margin: 0; }}
+  svg.flow .panel ul.loads li {{ display: flex; justify-content: space-between; padding: .2em 0; }}
+  svg.flow .panel ul.loads li span {{ color: var(--muted); font-variant-numeric: tabular-nums; }}
+  svg.flow .panel ul.loads li.muted {{ color: var(--muted); justify-content: center; }}
+  svg.flow .panel form {{ margin: 0; padding: 0; }}
+  svg.flow .panel .mode-btn {{ display: flex; justify-content: space-between; align-items: baseline; width: 100%; text-align: left; padding: .4em .6em; margin-bottom: .3em; border: 1px solid #8884; border-radius: 6px; background: transparent; cursor: pointer; font: inherit; color: inherit; }}
+  svg.flow .panel .mode-btn:hover {{ background: #0001; }}
+  svg.flow .panel .mode-btn.active {{ border-color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }}
+  svg.flow .panel .mode-btn small {{ color: var(--muted); font-variant-numeric: tabular-nums; }}
   h1 {{ margin: 0 0 .2em 0; font-size: 1.3em; }}
   .sub {{ color: var(--muted); margin: 0 0 1.5em 0; font-size: .85em; }}
   h2 {{ margin: 1.5em 0 .4em 0; font-size: 1em; border-bottom: 1px solid #8882; padding-bottom: .2em; }}
@@ -430,7 +572,7 @@ def _render(flash: str = "", flash_ok: bool = True, demo: str = "") -> str:
 <p class="sub">{now} &middot; auto-refresh 15s</p>
 {flash_html}
 
-{_flow_svg(pw, consumers, ev)}
+{_flow_svg(pw, ev, consumers)}
 
 <h2>Powerwall</h2>
 <table>{pw_rows}</table>
@@ -454,6 +596,18 @@ def _render(flash: str = "", flash_ok: bool = True, demo: str = "") -> str:
 @app.get("/", response_class=HTMLResponse)
 def index(demo: str = "") -> str:
     return _render(demo=demo)
+
+
+@app.post("/mode")
+def set_mode(mode: Annotated[str, Form()]) -> RedirectResponse:
+    global _charge_mode
+    if mode in _CHARGE_MODES:
+        _charge_mode = mode
+        logger.info("charge mode -> {}", mode)
+        pw, _ = _safe_pw()
+        ev, _ = _safe_em()
+        _apply_target(compute_target(mode, pw, ev, settings))
+    return RedirectResponse("/", status_code=303)
 
 
 @app.post("/set")

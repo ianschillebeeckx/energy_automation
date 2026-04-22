@@ -24,6 +24,11 @@ from .powerwall import PowerReading
 class Decision:
     target_amps: int
     reason: str
+    # Whether the EVSE should be charging *right now*. When False, target_amps
+    # still carries the rate the controller thinks the charger should be
+    # configured at (e.g. the preview for a scheduled mode), so the dashboard
+    # shows something meaningful while the breaker is paused.
+    on: bool = True
 
 
 def decide_ev_amps(
@@ -33,7 +38,10 @@ def decide_ev_amps(
 ) -> Decision:
     # Battery reserve gate: don't pull for EV until Powerwall is well-charged.
     if pw.battery_soc_pct < settings.battery_reserve_pct:
-        return Decision(0, f"battery {pw.battery_soc_pct:.0f}% < reserve {settings.battery_reserve_pct}%")
+        return Decision(
+            0, f"battery {pw.battery_soc_pct:.0f}% < reserve {settings.battery_reserve_pct}%",
+            on=False,
+        )
 
     # Current EV draw in watts. If off, treat as 0.
     ev_w_now = ev.charge_rate_a * settings.ev_voltage if ev.on else 0
@@ -46,6 +54,6 @@ def decide_ev_amps(
 
     target_amps = int(surplus_w // settings.ev_voltage)
     if target_amps < settings.ev_min_amps:
-        return Decision(0, f"surplus {surplus_w:.0f}W < min {settings.ev_min_amps}A")
+        return Decision(0, f"surplus {surplus_w:.0f}W < min {settings.ev_min_amps}A", on=False)
     target_amps = min(target_amps, settings.ev_max_amps)
-    return Decision(target_amps, f"surplus {surplus_w:.0f}W -> {target_amps}A")
+    return Decision(target_amps, f"surplus {surplus_w:.0f}W -> {target_amps}A", on=True)
