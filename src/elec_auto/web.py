@@ -50,9 +50,14 @@ _CHARGE_MODES: dict[str, str] = {
     "surplus":      "Surplus solar",
     "morning_dump": "Morning dump",
     "trickle":      f"Trickle ({settings.trickle_kw:.0f} kW)",
+    "manual":       "Manual",
     "off":          "Off",
 }
 _charge_mode: str = "surplus"
+# Tracks whether morning_dump has been actively pushing this window. Used to
+# trigger an auto-flip to "surplus" once the dump completes (floor reached
+# or window closed after activity).
+_dump_was_active: bool = False
 
 
 def _powerwall() -> Powerwall:
@@ -132,9 +137,29 @@ def _apply_target(decision: Decision) -> None:
 
 
 def _control_tick() -> None:
+    global _charge_mode, _dump_was_active
+    if _charge_mode == "manual":
+        return  # hands off: leave the EVSE entirely under manual control
     pw, _ = _safe_pw()
     ev, _ = _safe_em()
     decision = compute_target(_charge_mode, pw, ev, settings)
+
+    # Auto-switch morning_dump -> surplus when the dump is done, so the
+    # car keeps catching daytime surplus once the battery is drained.
+    if _charge_mode == "morning_dump":
+        is_active = decision.on and "dump " in decision.reason
+        floor_reached = "at/below floor" in decision.reason
+        # "scheduled" means we're outside the window. If we'd been active in
+        # this morning's window, that means the window just closed.
+        window_closed = "scheduled" in decision.reason and _dump_was_active
+        if is_active:
+            _dump_was_active = True
+        elif floor_reached or window_closed:
+            logger.info("morning_dump complete ({}) -> surplus", decision.reason)
+            _charge_mode = "surplus"
+            _dump_was_active = False
+            decision = compute_target(_charge_mode, pw, ev, settings)
+
     if ev is None:
         return
     has_rate = decision.target_amps >= settings.ev_min_amps
@@ -164,7 +189,7 @@ _FO_NS = 'xmlns="http://www.w3.org/1999/xhtml"'
 _PANEL_X = 640
 _PANEL_W = 210
 _LOADS_PANEL = (_PANEL_X, 150, _PANEL_W, 120)   # aligns with Home (y=180..240)
-_MODES_PANEL = (_PANEL_X, 270, _PANEL_W, 180)   # aligns with Car  (y=340..400), tall enough for 4 buttons
+_MODES_PANEL = (_PANEL_X, 250, _PANEL_W, 200)   # aligns with Car  (y=340..400), tall enough for 5 buttons
 
 
 def _loads_foreign(consumers: list[tuple[str, float]] | None) -> str:
@@ -186,30 +211,42 @@ def _loads_foreign(consumers: list[tuple[str, float]] | None) -> str:
 
 
 def _modes_foreign(pw: PowerReading | None, ev: ChargerState | None) -> str:
-    rows = []
-    for key, label in _CHARGE_MODES.items():
-        cls = "mode-btn active" if key == _charge_mode else "mode-btn"
-        hint = ""
+    # Two pairs of buttons sit side-by-side at the bottom of the panel so
+    # the column doesn't have to widen. Anything in `_PAIRED_KEYS` collapses
+    # into a flex row.
+    paired = {"off", "manual"}
+
+    def _hint_for(key: str) -> str:
         if key == "trickle":
             d = compute_target(key, pw, None, settings)
-            hint = f'<small>&rarr; {d.target_amps} A</small>'
-        elif key == "surplus":
+            return f'<small>&rarr; {d.target_amps} A</small>'
+        if key == "surplus":
             d = compute_target(key, pw, ev, settings)
-            if d.target_amps:
-                hint = f'<small>&rarr; {d.target_amps} A</small>'
-            else:
-                hint = f'<small>{html.escape(d.reason)}</small>'
-        elif key == "morning_dump":
+            return (f'<small>&rarr; {d.target_amps} A</small>'
+                    if d.target_amps else f'<small>{html.escape(d.reason)}</small>')
+        if key == "morning_dump":
             preview_now = _next_dump_start(settings)
             d = compute_target(key, pw, None, settings, now=preview_now)
-            if d.target_amps:
-                hint = f'<small>{preview_now:%H:%M} &rarr; {d.target_amps} A</small>'
-            else:
-                hint = f'<small>{html.escape(d.reason)}</small>'
-        rows.append(
+            return (f'<small>{preview_now:%H:%M} &rarr; {d.target_amps} A</small>'
+                    if d.target_amps else f'<small>{html.escape(d.reason)}</small>')
+        return ""
+
+    def _btn(key: str, label: str) -> str:
+        cls = "mode-btn active" if key == _charge_mode else "mode-btn"
+        return (
             f'<button type="submit" name="mode" value="{key}" class="{cls}">'
-            f'{label}{hint}</button>'
+            f'{label}{_hint_for(key)}</button>'
         )
+
+    rows: list[str] = []
+    pair_buf: list[str] = []
+    for key, label in _CHARGE_MODES.items():
+        if key in paired:
+            pair_buf.append(_btn(key, label))
+        else:
+            rows.append(_btn(key, label))
+    if pair_buf:
+        rows.append(f'<div class="mode-row">{"".join(pair_buf)}</div>')
     x, y, w, h = _MODES_PANEL
     return (
         f'<foreignObject x="{x}" y="{y}" width="{w}" height="{h}">'
@@ -539,8 +576,10 @@ def _render(flash: str = "", flash_ok: bool = True, demo: str = "") -> str:
   svg.flow .node-value {{ font-size: 12px; fill: var(--muted); }}
   svg.flow .flow-label {{ font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; paint-order: stroke; stroke: var(--node-bg); stroke-width: 3px; }}
   /* Panels embedded in the SVG via <foreignObject>. They use the same
-     coordinate system as the nodes so they stay aligned at every zoom. */
-  svg.flow .panel {{ font-size: 12px; color: currentColor; }}
+     coordinate system as the nodes so they stay aligned at every zoom.
+     Flex column + justify-content centers the content vertically inside
+     the box so it lines up with its companion node. */
+  svg.flow .panel {{ font-size: 12px; color: currentColor; height: 100%; box-sizing: border-box; display: flex; flex-direction: column; justify-content: center; }}
   svg.flow .panel h3 {{ font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 .4em 0; }}
   svg.flow .panel ul.loads {{ list-style: none; padding: 0; margin: 0; }}
   svg.flow .panel ul.loads li {{ display: flex; justify-content: space-between; padding: .2em 0; }}
@@ -548,6 +587,8 @@ def _render(flash: str = "", flash_ok: bool = True, demo: str = "") -> str:
   svg.flow .panel ul.loads li.muted {{ color: var(--muted); justify-content: center; }}
   svg.flow .panel form {{ margin: 0; padding: 0; }}
   svg.flow .panel .mode-btn {{ display: flex; justify-content: space-between; align-items: baseline; width: 100%; text-align: left; padding: .4em .6em; margin-bottom: .3em; border: 1px solid #8884; border-radius: 6px; background: transparent; cursor: pointer; font: inherit; color: inherit; }}
+  svg.flow .panel .mode-row {{ display: flex; gap: .3em; margin-bottom: .3em; }}
+  svg.flow .panel .mode-row .mode-btn {{ flex: 1 1 0; min-width: 0; justify-content: center; margin-bottom: 0; }}
   svg.flow .panel .mode-btn:hover {{ background: #0001; }}
   svg.flow .panel .mode-btn.active {{ border-color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }}
   svg.flow .panel .mode-btn small {{ color: var(--muted); font-variant-numeric: tabular-nums; }}
@@ -599,13 +640,15 @@ def index(demo: str = "") -> str:
 
 @app.post("/mode")
 def set_mode(mode: Annotated[str, Form()]) -> RedirectResponse:
-    global _charge_mode
+    global _charge_mode, _dump_was_active
     if mode in _CHARGE_MODES:
         _charge_mode = mode
+        _dump_was_active = False
         logger.info("charge mode -> {}", mode)
-        pw, _ = _safe_pw()
-        ev, _ = _safe_em()
-        _apply_target(compute_target(mode, pw, ev, settings))
+        if mode != "manual":
+            pw, _ = _safe_pw()
+            ev, _ = _safe_em()
+            _apply_target(compute_target(mode, pw, ev, settings))
     return RedirectResponse("/", status_code=303)
 
 

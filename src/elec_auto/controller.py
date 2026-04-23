@@ -26,7 +26,9 @@ def _next_dump_window(now: datetime, settings: Settings) -> tuple[datetime, date
     the next morning's start time.
     """
     start_today = now.replace(
-        hour=settings.morning_dump_start_hour, minute=0, second=0, microsecond=0,
+        hour=settings.morning_dump_start_hour,
+        minute=settings.morning_dump_start_minute,
+        second=0, microsecond=0,
     )
     end_today = start_today + timedelta(hours=settings.morning_dump_hours)
     if now < end_today:
@@ -46,6 +48,15 @@ def compute_target(
         # Charger off; keep whatever amperage was last configured so the
         # manual slider value survives for debugging.
         return Decision(0, "charging disabled", on=False)
+
+    if mode == "manual":
+        # Hands off — the control loop won't push to the EVSE in this mode,
+        # so this Decision is only used for the dashboard's status line.
+        return Decision(
+            ev.charge_rate_a if ev else 0,
+            "manual control (loop paused)",
+            on=bool(ev and ev.on),
+        )
 
     if mode == "surplus":
         if pw is None or ev is None:

@@ -46,10 +46,14 @@ class Settings(BaseSettings):
     # Powerwall usable capacity (kWh). One PW3 unit is 13.5 kWh; override
     # in .env if the site has more. Used by the morning-dump calculator.
     battery_capacity_kwh: float = 13.5
-    # Morning-dump floor SoC and window (hours) the dump should finish in.
-    morning_dump_floor_pct: int = Field(default=15, ge=5, le=95)
-    morning_dump_hours: float = 1.0
-    morning_dump_start_hour: int = Field(default=7, ge=0, le=23)
+    # Morning-dump window: starts at `start_hour` and runs for `hours`.
+    # Default 06:00 + 2 h spreads the dump across two hours so the per-tick
+    # amperage is roughly halved vs a 1 h window — gentler on the EVSE,
+    # car charger, and battery.
+    morning_dump_floor_pct: int = Field(default=15, ge=5, le=99)
+    morning_dump_hours: float = 2.0
+    morning_dump_start_hour: int = Field(default=6, ge=0, le=23)
+    morning_dump_start_minute: int = Field(default=0, ge=0, le=59)
     # Trickle mode fixed rate.
     trickle_kw: float = 2.0
 
