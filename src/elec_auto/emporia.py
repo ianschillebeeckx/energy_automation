@@ -34,10 +34,23 @@ class ChargerState:
     max_charge_rate_a: int
     # EVSE-reported operational state: "Standby", "Charging", "Disconnected"...
     status: str
+    # Instantaneous draw of the EVSE in watts (averaged over the last minute
+    # via Emporia's Vue2 channel reading). None when the cloud read failed.
+    actual_watts: float | None = None
 
     @property
     def charging(self) -> bool:
         return self.on and self.status.lower() == "charging"
+
+    @property
+    def plugged_in(self) -> bool:
+        """True when a car is physically connected to the EVSE.
+
+        Emporia reports ``status="Disconnected"`` when the J1772 handle is
+        out of the car. Anything else (Standby, Charging, etc.) implies a
+        car is plugged in.
+        """
+        return self.status.lower() not in {"disconnected", ""}
 
 
 class Emporia:
@@ -92,6 +105,27 @@ class Emporia:
         parent = self._select()
         updated = self._vue.update_charger(parent.ev_charger, on=on, charge_rate=amps)
         return self._state(parent, updated)
+
+    def actual_watts(self) -> float | None:
+        """Instantaneous draw of the EVSE, in watts.
+
+        Reads the charger device's main channel via `get_device_list_usage`.
+        Returns None when the cloud reports nothing (rare cold-start glitch).
+        """
+        parent = self._select()
+        usage = self._vue.get_device_list_usage(
+            [parent.device_gid],
+            instant=datetime.now(timezone.utc),
+            scale=Scale.MINUTE.value,
+        )
+        dev = usage.get(parent.device_gid)
+        if dev is None:
+            return None
+        # Single-channel "Main" reading on the charger device.
+        ch = next(iter(dev.channels.values()), None)
+        if ch is None or ch.usage is None:
+            return None
+        return float(ch.usage) * _KWH_PER_MIN_TO_W
 
     def set_on(self, on: bool) -> ChargerState:
         """Toggle the charger on/off without changing the configured amperage.

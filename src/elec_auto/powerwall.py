@@ -51,8 +51,12 @@ class _LocalGateway:
 
     _TOKEN_REFRESH_SEC = 1800.0
     _RATELIMIT_COOLDOWN_SEC = 300.0  # back off 5 min on 429 to avoid amplifying it
+    # Cache one read() result for this long. Set just under the default
+    # poll_interval_sec (30s) so each control-loop tick still fetches fresh
+    # data, but the dashboard's 15s auto-refreshes piggyback on that.
+    _READ_CACHE_TTL_SEC = 25.0
 
-    def __init__(self, host: str, customer_password: str, timeout: float = 8.0) -> None:
+    def __init__(self, host: str, customer_password: str, timeout: float = 15.0) -> None:
         self._host = host
         self._password = customer_password
         self._timeout = timeout
@@ -61,6 +65,8 @@ class _LocalGateway:
         self._token: str | None = None
         self._token_t = 0.0
         self._cooldown_until = 0.0
+        self._cached_reading: PowerReading | None = None
+        self._cached_at = 0.0
 
     def _login(self) -> None:
         if time.monotonic() < self._cooldown_until:
@@ -95,15 +101,21 @@ class _LocalGateway:
         return r.json()
 
     def read(self) -> PowerReading:
+        if (self._cached_reading is not None
+                and time.monotonic() - self._cached_at < self._READ_CACHE_TTL_SEC):
+            return self._cached_reading
         aggs = self._get("/api/meters/aggregates")
         soe = self._get("/api/system_status/soe")
-        return PowerReading(
+        reading = PowerReading(
             solar_w=float(aggs.get("solar", {}).get("instant_power", 0.0)),
             load_w=float(aggs.get("load", {}).get("instant_power", 0.0)),
             battery_w=float(aggs.get("battery", {}).get("instant_power", 0.0)),
             grid_w=float(aggs.get("site", {}).get("instant_power", 0.0)),
             battery_soc_pct=float(soe.get("percentage", float("nan"))),
         )
+        self._cached_reading = reading
+        self._cached_at = time.monotonic()
+        return reading
 
 
 class _CloudGateway:

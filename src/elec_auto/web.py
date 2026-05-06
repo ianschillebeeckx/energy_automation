@@ -21,6 +21,7 @@ from .config import settings
 from .controller import compute_target
 from .emporia import ChargerState, Emporia
 from .flow import Flows, decompose
+from .nest import Nest
 from .policy import Decision
 from .powerwall import Powerwall, PowerReading
 
@@ -45,9 +46,10 @@ app = FastAPI(title="elec_auto", docs_url=None, redoc_url=None, lifespan=_lifesp
 
 _pw: Powerwall | None = None
 _em: Emporia | None = None
+_nest: Nest | None = None
 
 _CHARGE_MODES: dict[str, str] = {
-    "surplus":      "Surplus solar",
+    "surplus":      "Surplus energy",
     "morning_dump": "Morning dump",
     "trickle":      f"Trickle ({settings.trickle_kw:.0f} kW)",
     "manual":       "Manual",
@@ -58,6 +60,16 @@ _charge_mode: str = "surplus"
 # trigger an auto-flip to "surplus" once the dump completes (floor reached
 # or window closed after activity).
 _dump_was_active: bool = False
+# Counts consecutive ticks where the Powerwall read failed. Crosses
+# `pw_fail_safe_ticks` => charger off until reads recover.
+_pw_fail_count: int = 0
+# Latches once the EV is detected as "plugged but not drawing" (full / faulted
+# / paused). Resets on mode change or unplug → replug. While set, surplus mode
+# treats the EV as unavailable and routes power to the Nest path instead.
+_ev_not_accepting: bool = False
+# Tracks plugged_in transitions so we can reset _ev_not_accepting when the
+# user unplugs and replugs the car (a clean signal of "I want to retest").
+_ev_was_plugged_in: bool = False
 
 
 def _powerwall() -> Powerwall:
@@ -74,20 +86,34 @@ def _emporia() -> Emporia:
     return _em
 
 
+def _nest_client() -> Nest:
+    global _nest
+    if _nest is None:
+        _nest = Nest(settings)
+    return _nest
+
+
 def _safe_pw() -> tuple[PowerReading | None, str | None]:
     try:
         return _powerwall().read(), None
     except Exception as e:
-        logger.exception("powerwall read failed")
+        logger.warning("powerwall read failed: {}", e)
         return None, str(e)
 
 
 def _safe_em() -> tuple[ChargerState | None, str | None]:
     try:
-        return _emporia().read(), None
+        em = _emporia()
+        ev = em.read()
     except Exception as e:
         logger.exception("emporia read failed")
         return None, str(e)
+    try:
+        ev.actual_watts = em.actual_watts()
+    except Exception:
+        logger.warning("emporia draw read failed", exc_info=False)
+        ev.actual_watts = None
+    return ev, None
 
 
 def _safe_top_consumers(n: int = 3) -> list[tuple[str, float]] | None:
@@ -106,6 +132,110 @@ def _next_dump_start(s) -> datetime:
     return _next_dump_window(datetime.now(ZoneInfo(s.timezone)), s)[0]
 
 
+def _surplus_watts(pw: PowerReading) -> float:
+    """Same surplus formula the policy uses, for the Nest dispatch decision."""
+    if pw.battery_soc_pct < settings.battery_reserve_pct:
+        battery_reserve_w = settings.battery_max_charge_kw * 1000
+    else:
+        battery_reserve_w = 0
+    return pw.solar_w - pw.load_w - battery_reserve_w
+
+
+def _restore_nest_default() -> None:
+    """Push the Nest setpoint back to the default target when leaving
+    surplus mode. Only acts if the current setpoint is still the surplus
+    value we'd previously written, so a manual change you make mid-window
+    survives the mode switch.
+    """
+    try:
+        nest = _nest_client()
+    except Exception:
+        return
+    if not nest.enabled:
+        return
+    try:
+        state = nest.read()
+    except Exception:
+        logger.warning("nest read failed during cleanup", exc_info=False)
+        return
+    if state.mode == "HEAT":
+        cur, surplus_t, default_t = (
+            state.heat_setpoint_f,
+            settings.nest_surplus_heat_f,
+            settings.nest_default_heat_f,
+        )
+        if cur is None or abs(cur - surplus_t) > 0.5:
+            return  # not at our surplus target — leave alone
+        try:
+            nest.set_heat_target_f(default_t)
+            logger.info("nest cleanup: HEAT {:.1f} F -> {} F", cur, default_t)
+        except Exception:
+            logger.warning("nest cleanup set_heat failed", exc_info=False)
+    elif state.mode == "COOL":
+        cur, surplus_t, default_t = (
+            state.cool_setpoint_f,
+            settings.nest_surplus_cool_f,
+            settings.nest_default_cool_f,
+        )
+        if cur is None or abs(cur - surplus_t) > 0.5:
+            return
+        try:
+            nest.set_cool_target_f(default_t)
+            logger.info("nest cleanup: COOL {:.1f} F -> {} F", cur, default_t)
+        except Exception:
+            logger.warning("nest cleanup set_cool failed", exc_info=False)
+
+
+def _run_nest_path(pw: PowerReading) -> None:
+    """Manage the Nest setpoint while we're in surplus mode and the EV
+    isn't accepting energy. Picks heat-up vs cool-down based on the
+    thermostat's current operating mode and only writes when the target
+    differs from the current setpoint by more than 0.5 °F.
+    """
+    try:
+        nest = _nest_client()
+    except Exception:
+        logger.exception("nest init failed")
+        return
+    if not nest.enabled:
+        return
+    try:
+        state = nest.read()
+    except Exception:
+        logger.warning("nest read failed", exc_info=False)
+        return
+
+    has_surplus = _surplus_watts(pw) > 0
+
+    if state.mode == "HEAT":
+        target = (settings.nest_surplus_heat_f if has_surplus
+                  else settings.nest_default_heat_f)
+        cur = state.heat_setpoint_f
+        if cur is None or abs(cur - target) > 0.5:
+            try:
+                nest.set_heat_target_f(target)
+                logger.info(
+                    "nest: HEAT {:.1f} F -> {} F (surplus={:.0f} W)",
+                    cur if cur is not None else float("nan"), target, _surplus_watts(pw),
+                )
+            except Exception:
+                logger.warning("nest set_heat failed", exc_info=False)
+    elif state.mode == "COOL":
+        target = (settings.nest_surplus_cool_f if has_surplus
+                  else settings.nest_default_cool_f)
+        cur = state.cool_setpoint_f
+        if cur is None or abs(cur - target) > 0.5:
+            try:
+                nest.set_cool_target_f(target)
+                logger.info(
+                    "nest: COOL {:.1f} F -> {} F (surplus={:.0f} W)",
+                    cur if cur is not None else float("nan"), target, _surplus_watts(pw),
+                )
+            except Exception:
+                logger.warning("nest set_cool failed", exc_info=False)
+    # HEATCOOL / OFF / ECO: don't push, the Nest's own logic owns it.
+
+
 def _apply_target(decision: Decision) -> None:
     """Push a target decision to the EVSE.
 
@@ -121,7 +251,7 @@ def _apply_target(decision: Decision) -> None:
         logger.exception("apply: emporia init failed")
         return
     try:
-        if decision.on:
+        if decision.on and decision.target_amps >= settings.ev_min_amps:
             em.set_amps(decision.target_amps, on=True)
             logger.info("apply: mode={} set {} A on ({})",
                         _charge_mode, decision.target_amps, decision.reason)
@@ -137,12 +267,63 @@ def _apply_target(decision: Decision) -> None:
 
 
 def _control_tick() -> None:
-    global _charge_mode, _dump_was_active
+    global _charge_mode, _dump_was_active, _pw_fail_count
+    global _ev_not_accepting, _ev_was_plugged_in
     if _charge_mode == "manual":
         return  # hands off: leave the EVSE entirely under manual control
     pw, _ = _safe_pw()
     ev, _ = _safe_em()
-    decision = compute_target(_charge_mode, pw, ev, settings)
+
+    # Update the "not accepting charge" latch using actual EV draw.
+    # Reset on plug → replug; once we conclude the car isn't accepting, stay
+    # in that state to avoid flapping the charger on/off to retest.
+    if ev is not None:
+        if ev.plugged_in and not _ev_was_plugged_in:
+            _ev_not_accepting = False  # fresh plug; give it a chance
+        _ev_was_plugged_in = ev.plugged_in
+        if not ev.plugged_in:
+            _ev_not_accepting = False
+        elif (ev.on and ev.actual_watts is not None
+                and ev.actual_watts < settings.ev_accepting_threshold_w):
+            if not _ev_not_accepting:
+                logger.info(
+                    "EV draw {:.0f} W < {} W threshold — treating as not accepting",
+                    ev.actual_watts, settings.ev_accepting_threshold_w,
+                )
+            _ev_not_accepting = True
+
+    # If we've decided the car isn't accepting, present it to the policy as
+    # "Disconnected" so the surplus path bails out (and, once Nest is wired,
+    # the controller will hand off to the heating path).
+    ev_for_decision = ev
+    if ev is not None and _ev_not_accepting:
+        from dataclasses import replace
+        ev_for_decision = replace(ev, status="Disconnected")
+
+    # Modes that need a Powerwall reading: ride out brief outages by
+    # skipping the tick, but fail safe to off after `pw_fail_safe_ticks`
+    # consecutive failures so a stuck gateway doesn't leave the charger
+    # blasting indefinitely.
+    if _charge_mode in {"surplus", "morning_dump"}:
+        if pw is None:
+            _pw_fail_count += 1
+            threshold = settings.pw_fail_safe_ticks
+            if _pw_fail_count == threshold:
+                logger.warning(
+                    "telemetry stale {} ticks — failing safe to off", threshold,
+                )
+                _apply_target(Decision(0, "telemetry stale", on=False))
+            return
+        if _pw_fail_count > 0:
+            logger.info("telemetry recovered after {} failures", _pw_fail_count)
+            _pw_fail_count = 0
+
+    decision = compute_target(_charge_mode, pw, ev_for_decision, settings)
+
+    # Surplus mode + EV unavailable => let Nest take the surplus.
+    if (_charge_mode == "surplus" and pw is not None
+            and (ev is None or not ev.plugged_in or _ev_not_accepting)):
+        _run_nest_path(pw)
 
     # Auto-switch morning_dump -> surplus when the dump is done, so the
     # car keeps catching daytime surplus once the battery is drained.
@@ -640,11 +821,17 @@ def index(demo: str = "") -> str:
 
 @app.post("/mode")
 def set_mode(mode: Annotated[str, Form()]) -> RedirectResponse:
-    global _charge_mode, _dump_was_active
+    global _charge_mode, _dump_was_active, _pw_fail_count, _ev_not_accepting
     if mode in _CHARGE_MODES:
+        previous = _charge_mode
         _charge_mode = mode
         _dump_was_active = False
+        _pw_fail_count = 0
+        _ev_not_accepting = False
         logger.info("charge mode -> {}", mode)
+        # Leaving surplus: undo our setpoint nudge if it's still in place.
+        if previous == "surplus" and mode != "surplus":
+            _restore_nest_default()
         if mode != "manual":
             pw, _ = _safe_pw()
             ev, _ = _safe_em()

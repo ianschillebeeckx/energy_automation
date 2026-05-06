@@ -19,6 +19,7 @@ from elec_auto.powerwall import PowerReading
 def _settings(**overrides) -> Settings:
     defaults = dict(
         battery_reserve_pct=80,
+        battery_max_charge_kw=5.0,
         ev_min_amps=6,
         ev_max_amps=40,
         ev_voltage=240,
@@ -42,26 +43,52 @@ def _ev(*, on=False, rate=0, maxrate=40, status="Standby") -> ChargerState:
     )
 
 
-# --- battery reserve gate ------------------------------------------------
+# --- battery-reserve subtraction -----------------------------------------
 
-def test_below_reserve_returns_zero_even_with_surplus() -> None:
+def test_below_full_reserves_battery_charge_power() -> None:
+    # 10 kW solar, 0.5 kW house, SoC 50% < 80% threshold:
+    # surplus = 10000 - 500 - 5000 (battery reserve) = 4500 W -> 18 A.
     d = decide_ev_amps(
-        _pw(solar=10_000, load=500, soc=79.9),
+        _pw(solar=10_000, load=500, soc=50),
+        _ev(on=False),
+        _settings(),
+    )
+    assert d.target_amps == 18
+
+
+def test_at_reserve_threshold_drops_battery_reservation() -> None:
+    # SoC == battery_reserve_pct: battery is treated as full, no 5 kW reservation.
+    # surplus = 10000 - 500 - 0 = 9500 W -> 39 A (under the 40 A cap).
+    d = decide_ev_amps(
+        _pw(solar=10_000, load=500, soc=80.0),
+        _ev(on=False),
+        _settings(),
+    )
+    assert d.target_amps == 39
+
+
+def test_unplugged_car_returns_zero_even_with_surplus() -> None:
+    # Even when there's plenty of solar, an unplugged EVSE shouldn't try to
+    # push amps. The Nest path (when enabled) handles that case elsewhere.
+    d = decide_ev_amps(
+        _pw(solar=10_000, load=500, soc=80),
+        _ev(on=False, status="Disconnected"),
+        _settings(),
+    )
+    assert d.target_amps == 0
+    assert "unplugged" in d.reason
+
+
+def test_below_full_with_no_room_after_battery_reserve_returns_zero() -> None:
+    # 5 kW solar barely covers the 5 kW battery reserve when SoC < threshold,
+    # so nothing is left for the EV.
+    d = decide_ev_amps(
+        _pw(solar=5000, load=200, soc=70),
         _ev(on=False),
         _settings(),
     )
     assert d.target_amps == 0
-    assert "reserve" in d.reason
-
-
-def test_at_reserve_exactly_proceeds() -> None:
-    # 80% SoC, 80% reserve — the boundary should admit the EV.
-    d = decide_ev_amps(
-        _pw(solar=2000, load=0, soc=80.0),
-        _ev(on=False),
-        _settings(),
-    )
-    assert d.target_amps > 0
+    assert "soc 70" in d.reason
 
 
 # --- surplus -> amps conversion -----------------------------------------

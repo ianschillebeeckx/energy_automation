@@ -56,6 +56,25 @@ def run() -> None:
 
 
 @app.command()
+def nest() -> None:
+    """Read the Nest thermostat state via SDM. Verifies credentials/refresh."""
+    from .nest import Nest as _Nest
+
+    n = _Nest(settings)
+    if not n.enabled:
+        typer.echo("nest not enabled or credentials incomplete in .env", err=True)
+        raise typer.Exit(code=1)
+    state = n.read()
+    logger.info(
+        "nest: mode={} setpoint_heat={} F ambient={:.1f} F hvac={}",
+        state.mode,
+        f"{state.heat_setpoint_f:.1f}" if state.heat_setpoint_f is not None else "n/a",
+        state.ambient_f,
+        state.hvac_status,
+    )
+
+
+@app.command()
 def serve(
     host: str = typer.Option("0.0.0.0", help="Bind address. Default exposes to LAN; no auth — keep off untrusted networks."),
     port: int = typer.Option(8000, help="Port for the web UI."),
