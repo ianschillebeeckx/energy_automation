@@ -21,7 +21,7 @@ from .config import settings
 from .controller import compute_target
 from .emporia import ChargerState, Emporia
 from .flow import Flows, decompose
-from .nest import Nest
+from .nest import Nest, ThermoState
 from .policy import Decision
 from .powerwall import Powerwall, PowerReading
 
@@ -114,6 +114,16 @@ def _safe_em() -> tuple[ChargerState | None, str | None]:
         logger.warning("emporia draw read failed", exc_info=False)
         ev.actual_watts = None
     return ev, None
+
+
+def _safe_nest() -> tuple[ThermoState | None, str | None]:
+    if not settings.nest_enabled:
+        return None, None  # quietly omit the section when disabled
+    try:
+        return _nest_client().read(), None
+    except Exception as e:
+        logger.warning("nest read failed: {}", e)
+        return None, str(e)
 
 
 def _safe_top_consumers(n: int = 3) -> list[tuple[str, float]] | None:
@@ -693,10 +703,12 @@ def _render(flash: str = "", flash_ok: bool = True, demo: str = "") -> str:
     if demo:
         pw, ev, consumers = _demo_state(demo)
         pw_err = ev_err = None
+        nest_state, nest_err = None, None
     else:
         pw, pw_err = _safe_pw()
         ev, ev_err = _safe_em()
         consumers = _safe_top_consumers()
+        nest_state, nest_err = _safe_nest()
     try:
         decision = compute_target(_charge_mode, pw, ev, settings)
     except Exception as e:
@@ -735,6 +747,41 @@ def _render(flash: str = "", flash_ok: bool = True, demo: str = "") -> str:
         f'<p class=decision><b>{html.escape(_CHARGE_MODES[_charge_mode])}:</b> '
         f'{decision.target_amps} A <small>({html.escape(decision.reason)})</small></p>'
     )
+
+    if nest_state is not None:
+        heat_default = (round(nest_state.heat_setpoint_f)
+                        if nest_state.heat_setpoint_f is not None else 65)
+        cool_default = (round(nest_state.cool_setpoint_f)
+                        if nest_state.cool_setpoint_f is not None else 70)
+        nest_rows = (
+            f"<tr><td>mode</td><td><b>{html.escape(nest_state.mode)}</b></td></tr>"
+            f"<tr><td>ambient</td><td>{nest_state.ambient_f:.1f} &deg;F</td></tr>"
+            f"<tr><td>HVAC</td><td>{html.escape(nest_state.hvac_status)}</td></tr>"
+            f"<tr><td>heat setpoint</td><td>"
+            f"{nest_state.heat_setpoint_f:.1f} &deg;F"
+            f"</td></tr>" if nest_state.heat_setpoint_f is not None else ""
+        )
+        if nest_state.cool_setpoint_f is not None:
+            nest_rows += (f"<tr><td>cool setpoint</td><td>"
+                          f"{nest_state.cool_setpoint_f:.1f} &deg;F</td></tr>")
+        nest_html = (
+            f"<h2>Nest</h2><table>{nest_rows}</table>"
+            f'<form method="post" action="/nest/heat">'
+            f'<label>Heat target (&deg;F): '
+            f'<input type="number" name="target_f" min="40" max="90" value="{heat_default}">'
+            f'</label> <button type="submit">Set heat</button></form>'
+            f'<form method="post" action="/nest/cool">'
+            f'<label>Cool target (&deg;F): '
+            f'<input type="number" name="target_f" min="55" max="90" value="{cool_default}">'
+            f'</label> <button type="submit">Set cool</button></form>'
+        )
+    elif nest_err:
+        nest_html = (
+            f'<h2>Nest</h2>'
+            f'<p class=err>Nest unavailable: {html.escape(nest_err)}</p>'
+        )
+    else:
+        nest_html = ""
 
     flash_html = ""
     if flash:
@@ -789,6 +836,8 @@ def _render(flash: str = "", flash_ok: bool = True, demo: str = "") -> str:
   .flash.ok {{ background: #2a71; color: var(--ok); }}
   .flash.err {{ background: #c331; color: var(--err); }}
   .err {{ color: var(--err); }}
+  .row {{ display: flex; gap: 1.5em; flex-wrap: wrap; align-items: flex-start; }}
+  .row > div {{ flex: 1 1 280px; min-width: 0; }}
 </style></head><body>
 <p class="sub">{now} &middot; auto-refresh 15s</p>
 {flash_html}
@@ -798,25 +847,32 @@ def _render(flash: str = "", flash_ok: bool = True, demo: str = "") -> str:
 <h2>Powerwall</h2>
 <table>{pw_rows}</table>
 
-<h2>EV Charger</h2>
-<table>{ev_rows}</table>
+<div class="row">
+  <div>
+    <h2>EV Charger</h2>
+    <table>{ev_rows}</table>
+  </div>
+  <div>
+    <h2>Manual override</h2>
+    <form method="post" action="/set">
+      <label><input type="checkbox" name="on" value="on" {on_checked}> Charger enabled</label>
+      <label>Charge current (A):
+        <input type="number" name="amps" min="{settings.ev_min_amps}" max="{settings.ev_max_amps}" value="{amps_value}">
+      </label>
+      <button type="submit">Apply</button>
+    </form>
+  </div>
+</div>
 
 {decision_html}
 
-<h2>Manual override</h2>
-<form method="post" action="/set">
-  <label><input type="checkbox" name="on" value="on" {on_checked}> Charger enabled</label>
-  <label>Charge current (A):
-    <input type="number" name="amps" min="{settings.ev_min_amps}" max="{settings.ev_max_amps}" value="{amps_value}">
-  </label>
-  <button type="submit">Apply</button>
-</form>
+{nest_html}
 </body></html>"""
 
 
 @app.get("/", response_class=HTMLResponse)
-def index(demo: str = "") -> str:
-    return _render(demo=demo)
+def index(demo: str = "", flash: str = "", ok: int = 1) -> str:
+    return _render(flash=flash, flash_ok=bool(ok), demo=demo)
 
 
 @app.post("/mode")
@@ -839,19 +895,50 @@ def set_mode(mode: Annotated[str, Form()]) -> RedirectResponse:
     return RedirectResponse("/", status_code=303)
 
 
+def _flash_redirect(flash: str, ok: bool) -> RedirectResponse:
+    """PRG-style redirect to / with flash carried in the query string. Avoids
+    the auto-refresh hitting POST-only URLs and getting 405s."""
+    from urllib.parse import urlencode
+
+    qs = urlencode({"flash": flash, "ok": "1" if ok else "0"})
+    return RedirectResponse(f"/?{qs}", status_code=303)
+
+
+@app.post("/nest/heat")
+def set_nest_heat(target_f: Annotated[int, Form()]) -> RedirectResponse:
+    try:
+        _nest_client().set_heat_target_f(target_f)
+        return _flash_redirect(f"Nest heat setpoint set to {target_f} °F", True)
+    except Exception as e:
+        logger.exception("nest set_heat failed")
+        return _flash_redirect(f"Nest set heat failed: {e}", False)
+
+
+@app.post("/nest/cool")
+def set_nest_cool(target_f: Annotated[int, Form()]) -> RedirectResponse:
+    try:
+        _nest_client().set_cool_target_f(target_f)
+        return _flash_redirect(f"Nest cool setpoint set to {target_f} °F", True)
+    except Exception as e:
+        logger.exception("nest set_cool failed")
+        return _flash_redirect(f"Nest set cool failed: {e}", False)
+
+
 @app.post("/set")
 def set_charger(
     amps: Annotated[int, Form()],
     on: Annotated[str | None, Form()] = None,
-) -> HTMLResponse:
+) -> RedirectResponse:
     desired_on = on == "on"
     try:
         new_state = _emporia().set_amps(amps, on=desired_on)
-        flash = f"Set charger {'ON' if new_state.on else 'OFF'} @ {new_state.charge_rate_a} A"
-        return HTMLResponse(_render(flash=flash, flash_ok=True))
+        return _flash_redirect(
+            f"Set charger {'ON' if new_state.on else 'OFF'} @ {new_state.charge_rate_a} A",
+            True,
+        )
     except Exception as e:
         logger.exception("set_amps failed")
-        return HTMLResponse(_render(flash=f"Failed: {e}", flash_ok=False), status_code=500)
+        return _flash_redirect(f"Failed: {e}", False)
 
 
 def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
