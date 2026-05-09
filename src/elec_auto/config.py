@@ -55,6 +55,11 @@ class Settings(BaseSettings):
     # Default ~80% of 6 A × 240 V = 1440 W, with a margin so brief lulls
     # don't trigger the flag.
     ev_accepting_threshold_w: int = Field(default=1100, ge=100)
+    # After this many seconds in the "not accepting" state, the controller
+    # clears the latch and tries again. If the car still won't accept it'll
+    # re-latch within a tick. Without this, a stuck latch persists until
+    # the user unplugs / replugs or switches modes.
+    ev_not_accepting_retest_sec: int = Field(default=600, ge=60)
 
     # Powerwall usable capacity (kWh). One PW3 unit is 13.5 kWh; override
     # in .env if the site has more. Used by the morning-dump calculator.

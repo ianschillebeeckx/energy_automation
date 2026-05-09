@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import html
 import math
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Annotated
@@ -64,9 +65,11 @@ _dump_was_active: bool = False
 # `pw_fail_safe_ticks` => charger off until reads recover.
 _pw_fail_count: int = 0
 # Latches once the EV is detected as "plugged but not drawing" (full / faulted
-# / paused). Resets on mode change or unplug → replug. While set, surplus mode
+# / paused). Resets on mode change, unplug → replug, or after the retest
+# timeout (`settings.ev_not_accepting_retest_sec`). While set, surplus mode
 # treats the EV as unavailable and routes power to the Nest path instead.
 _ev_not_accepting: bool = False
+_ev_not_accepting_since: float = 0.0  # monotonic time when latched
 # Tracks plugged_in transitions so we can reset _ev_not_accepting when the
 # user unplugs and replugs the car (a clean signal of "I want to retest").
 _ev_was_plugged_in: bool = False
@@ -278,21 +281,25 @@ def _apply_target(decision: Decision) -> None:
 
 def _control_tick() -> None:
     global _charge_mode, _dump_was_active, _pw_fail_count
-    global _ev_not_accepting, _ev_was_plugged_in
+    global _ev_not_accepting, _ev_not_accepting_since, _ev_was_plugged_in
     if _charge_mode == "manual":
         return  # hands off: leave the EVSE entirely under manual control
     pw, _ = _safe_pw()
     ev, _ = _safe_em()
 
-    # Update the "not accepting charge" latch using actual EV draw.
-    # Reset on plug → replug; once we conclude the car isn't accepting, stay
-    # in that state to avoid flapping the charger on/off to retest.
+    # Update the "not accepting charge" latch using actual EV draw. Reset on
+    # plug → replug, on unplug, and (importantly) after a retest timeout so
+    # we don't get stuck if the car becomes ready to charge again without
+    # an unplug.
+    now_m = time.monotonic()
     if ev is not None:
         if ev.plugged_in and not _ev_was_plugged_in:
-            _ev_not_accepting = False  # fresh plug; give it a chance
+            _ev_not_accepting = False
+            _ev_not_accepting_since = 0.0
         _ev_was_plugged_in = ev.plugged_in
         if not ev.plugged_in:
             _ev_not_accepting = False
+            _ev_not_accepting_since = 0.0
         elif (ev.on and ev.actual_watts is not None
                 and ev.actual_watts < settings.ev_accepting_threshold_w):
             if not _ev_not_accepting:
@@ -300,7 +307,19 @@ def _control_tick() -> None:
                     "EV draw {:.0f} W < {} W threshold — treating as not accepting",
                     ev.actual_watts, settings.ev_accepting_threshold_w,
                 )
+                _ev_not_accepting_since = now_m
             _ev_not_accepting = True
+
+    # Retest the latch after the timeout: clear it so the next tick tries
+    # pushing amps again. If the car still won't accept we'll re-latch.
+    if (_ev_not_accepting and _ev_not_accepting_since > 0.0
+            and now_m - _ev_not_accepting_since > settings.ev_not_accepting_retest_sec):
+        logger.info(
+            "EV not-accepting retest after {:.0f} min — clearing latch",
+            (now_m - _ev_not_accepting_since) / 60,
+        )
+        _ev_not_accepting = False
+        _ev_not_accepting_since = 0.0
 
     # If we've decided the car isn't accepting, present it to the policy as
     # "Disconnected" so the surplus path bails out (and, once Nest is wired,
@@ -877,13 +896,15 @@ def index(demo: str = "", flash: str = "", ok: int = 1) -> str:
 
 @app.post("/mode")
 def set_mode(mode: Annotated[str, Form()]) -> RedirectResponse:
-    global _charge_mode, _dump_was_active, _pw_fail_count, _ev_not_accepting
+    global _charge_mode, _dump_was_active, _pw_fail_count
+    global _ev_not_accepting, _ev_not_accepting_since
     if mode in _CHARGE_MODES:
         previous = _charge_mode
         _charge_mode = mode
         _dump_was_active = False
         _pw_fail_count = 0
         _ev_not_accepting = False
+        _ev_not_accepting_since = 0.0
         logger.info("charge mode -> {}", mode)
         # Leaving surplus: undo our setpoint nudge if it's still in place.
         if previous == "surplus" and mode != "surplus":
