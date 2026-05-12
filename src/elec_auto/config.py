@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     # we scale it to the Tesla-app "displayed" SoC via
     #     displayed = max(0, (raw - floor) / (100 - floor) * 100)
     # If Tesla ever changes this on PW3 firmware, adjust here.
-    battery_raw_floor_pct: float = Field(default=5.0, ge=0.0, le=20.0)
+    battery_raw_floor_pct: float = Field(default=5.0, ge=5.0, le=20.0)
     # Morning-dump window: starts at `start_hour` and runs for `hours`.
     # Default 06:00 + 2 h spreads the dump across two hours so the per-tick
     # amperage is roughly halved vs a 1 h window — gentler on the EVSE,
