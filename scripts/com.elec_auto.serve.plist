@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd user agent: keeps `elec-auto serve` running 24/7.
+
+  Install:
+      cp scripts/com.elec_auto.serve.plist ~/Library/LaunchAgents/
+      launchctl load ~/Library/LaunchAgents/com.elec_auto.serve.plist
+
+  Manage:
+      launchctl unload ~/Library/LaunchAgents/com.elec_auto.serve.plist  # stop
+      launchctl load   ~/Library/LaunchAgents/com.elec_auto.serve.plist  # start
+      launchctl list | grep elec_auto                                    # status
+
+  Logs:
+      tail -f ~/Library/Logs/elec_auto.log
+
+  The `caffeinate -i -s` wrapper prevents the system from idle-sleeping
+  while the dashboard is running, so the control loop keeps ticking even
+  if the user walks away from the keyboard. (Lid-close sleep still
+  applies; see scripts/setup_macos.sh for a system-wide no-sleep config.)
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.elec_auto.serve</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-i</string>
+        <string>-s</string>
+        <string>/usr/local/bin/uv</string>
+        <string>run</string>
+        <string>elec-auto</string>
+        <string>serve</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/ian/Development/elec_auto</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Wait 10 seconds before respawning after a crash -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/ian/Library/Logs/elec_auto.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/ian/Library/Logs/elec_auto.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

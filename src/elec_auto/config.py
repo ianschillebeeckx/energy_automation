@@ -46,11 +46,17 @@ class Settings(BaseSettings):
     # Powerwall usable capacity (kWh). One PW3 unit is 13.5 kWh; override
     # in .env if the site has more. Used by the morning-dump calculator.
     battery_capacity_kwh: float = 13.5
+    # Percent of raw battery capacity Tesla hides as the bottom-of-pack
+    # reserve. The local /api/system_status/soe endpoint returns raw SoC;
+    # we scale it to the Tesla-app "displayed" SoC via
+    #     displayed = max(0, (raw - floor) / (100 - floor) * 100)
+    # If Tesla ever changes this on PW3 firmware, adjust here.
+    battery_raw_floor_pct: float = Field(default=5.0, ge=0.0, le=20.0)
     # Morning-dump window: starts at `start_hour` and runs for `hours`.
     # Default 06:00 + 2 h spreads the dump across two hours so the per-tick
     # amperage is roughly halved vs a 1 h window — gentler on the EVSE,
     # car charger, and battery.
-    morning_dump_floor_pct: int = Field(default=15, ge=5, le=99)
+    morning_dump_floor_pct: int = Field(default=10, ge=5, le=99)
     morning_dump_hours: float = 2.0
     morning_dump_start_hour: int = Field(default=6, ge=0, le=23)
     morning_dump_start_minute: int = Field(default=0, ge=0, le=59)

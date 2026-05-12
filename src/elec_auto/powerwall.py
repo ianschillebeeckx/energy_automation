@@ -15,6 +15,7 @@ Two backends, selected by `POWERWALL_MODE`:
 
 from __future__ import annotations
 
+import math
 import time
 import warnings
 from dataclasses import dataclass
@@ -26,6 +27,20 @@ import urllib3
 from .config import Settings
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+def _to_displayed_soc(raw_pct: float, raw_floor_pct: float) -> float:
+    """Map raw PW3 SoC to the Tesla app's "displayed" %.
+
+    The bottom `raw_floor_pct` of physical capacity is invisible to the
+    Tesla app (it's the cell-health reserve). At raw == floor we show 0;
+    at raw == 100 we show 100. Everywhere in between we linearly map.
+    """
+    if math.isnan(raw_pct):
+        return raw_pct
+    span = max(1e-9, 100.0 - raw_floor_pct)
+    scaled = (raw_pct - raw_floor_pct) / span * 100.0
+    return max(0.0, min(100.0, scaled))
 
 
 @dataclass(slots=True)
@@ -52,9 +67,11 @@ class _LocalGateway:
     _TOKEN_REFRESH_SEC = 1800.0
     _RATELIMIT_COOLDOWN_SEC = 300.0  # back off 5 min on 429 to avoid amplifying it
 
-    def __init__(self, host: str, customer_password: str, timeout: float = 8.0) -> None:
+    def __init__(self, host: str, customer_password: str, raw_floor_pct: float,
+                 timeout: float = 8.0) -> None:
         self._host = host
         self._password = customer_password
+        self._raw_floor_pct = raw_floor_pct
         self._timeout = timeout
         self._session = requests.Session()
         self._session.verify = False
@@ -97,12 +114,13 @@ class _LocalGateway:
     def read(self) -> PowerReading:
         aggs = self._get("/api/meters/aggregates")
         soe = self._get("/api/system_status/soe")
+        raw_pct = float(soe.get("percentage", float("nan")))
         return PowerReading(
             solar_w=float(aggs.get("solar", {}).get("instant_power", 0.0)),
             load_w=float(aggs.get("load", {}).get("instant_power", 0.0)),
             battery_w=float(aggs.get("battery", {}).get("instant_power", 0.0)),
             grid_w=float(aggs.get("site", {}).get("instant_power", 0.0)),
-            battery_soc_pct=float(soe.get("percentage", float("nan"))),
+            battery_soc_pct=_to_displayed_soc(raw_pct, self._raw_floor_pct),
         )
 
 
@@ -153,7 +171,9 @@ class Powerwall:
             # Customer-portal password is the last 5 chars of the gateway password.
             customer_pw = settings.powerwall_gw_password[-5:]
             self._impl: _LocalGateway | _CloudGateway = _LocalGateway(
-                host=settings.powerwall_host, customer_password=customer_pw,
+                host=settings.powerwall_host,
+                customer_password=customer_pw,
+                raw_floor_pct=settings.battery_raw_floor_pct,
             )
         else:
             self._impl = _CloudGateway(settings, auth_dir)
