@@ -63,10 +63,31 @@ class Settings(BaseSettings):
     # Trickle mode fixed rate.
     trickle_kw: float = 2.0
 
+    # Sunset auto-transition: while in surplus mode, once local wall-clock
+    # time passes today's astronomical sunset (computed from latitude /
+    # longitude via the astral library), the control loop flips to
+    # morning_dump (queuing the next morning's scheduled charge). The
+    # transition is skipped if either coordinate is unset.
+    latitude: float | None = Field(default=None, ge=-90.0, le=90.0)
+    longitude: float | None = Field(default=None, ge=-180.0, le=180.0)
+
+    # Solar array geometry & rating for the theoretical-output model in
+    # solar.theoretical_w(). Azimuth: 0=N, 90=E, 180=S, 270=W. Tilt: degrees
+    # from horizontal. Loss factor: combined inverter + wiring + soiling +
+    # mismatch + temperature derate. Typical residential is ~0.09 (PVWatts
+    # default ~0.14, but newer micro-inverter installs tend lower).
+    solar_array_max_kw: float = Field(default=6.6, ge=0.5, le=50.0)
+    solar_panel_azimuth_deg: float = Field(default=180.0, ge=0.0, le=360.0)
+    solar_panel_tilt_deg: float = Field(default=30.0, ge=0.0, le=90.0)
+    solar_system_loss_factor: float = Field(default=0.09, ge=0.0, le=0.5)
+
     # Time zone passed to pypowerwall for timestamp handling.
     timezone: str = "America/Los_Angeles"
 
-    @field_validator("tesla_site_id", "emporia_evse_gid", mode="before")
+    @field_validator(
+        "tesla_site_id", "emporia_evse_gid", "latitude", "longitude",
+        mode="before",
+    )
     @classmethod
     def _empty_str_to_none(cls, v: object) -> object:
         # Blank values in .env (`FOO=`) arrive as "" — treat as unset.

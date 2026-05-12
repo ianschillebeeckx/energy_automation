@@ -23,6 +23,8 @@ from .emporia import ChargerState, Emporia
 from .flow import Flows, decompose
 from .policy import Decision
 from .powerwall import Powerwall, PowerReading
+from .samples import Sample, SampleStore
+from .solar import theoretical_w
 
 
 @asynccontextmanager
@@ -45,6 +47,15 @@ app = FastAPI(title="elec_auto", docs_url=None, redoc_url=None, lifespan=_lifesp
 
 _pw: Powerwall | None = None
 _em: Emporia | None = None
+_samples: SampleStore | None = None
+
+
+def _sample_store() -> SampleStore:
+    global _samples
+    if _samples is None:
+        from pathlib import Path
+        _samples = SampleStore(Path("state") / "samples.db")
+    return _samples
 
 _CHARGE_MODES: dict[str, str] = {
     "surplus":      "Surplus solar",
@@ -96,6 +107,42 @@ def _safe_top_consumers(n: int = 3) -> list[tuple[str, float]] | None:
     except Exception:
         logger.exception("emporia top_consumers failed")
         return None
+
+
+_sunset_cache: tuple[object, datetime] | None = None
+
+
+def _todays_sunset() -> datetime | None:
+    """Astronomical sunset for today at the configured location.
+
+    Returns None if latitude/longitude aren't set. Cached for the day so we
+    don't recompute on every tick.
+    """
+    global _sunset_cache
+    if settings.latitude is None or settings.longitude is None:
+        return None
+    from zoneinfo import ZoneInfo
+
+    from astral import Observer
+    from astral.sun import sun
+    tz = ZoneInfo(settings.timezone)
+    today = datetime.now(tz).date()
+    if _sunset_cache is not None and _sunset_cache[0] == today:
+        return _sunset_cache[1]
+    obs = Observer(latitude=settings.latitude, longitude=settings.longitude)
+    sunset = sun(obs, date=today, tzinfo=tz)["sunset"]
+    _sunset_cache = (today, sunset)
+    return sunset
+
+
+def _is_past_sunset() -> bool:
+    """True iff local time is at or past today's sunset (and we have coords)."""
+    from zoneinfo import ZoneInfo
+
+    sunset = _todays_sunset()
+    if sunset is None:
+        return False
+    return datetime.now(ZoneInfo(settings.timezone)) >= sunset
 
 
 def _next_dump_start(s) -> datetime:
@@ -160,6 +207,16 @@ def _control_tick() -> None:
             _dump_was_active = False
             decision = compute_target(_charge_mode, pw, ev, settings)
 
+    # Auto-switch surplus -> morning_dump once we cross today's astronomical
+    # sunset, queueing the next morning's scheduled charge.
+    if _charge_mode == "surplus" and _is_past_sunset():
+        logger.info("past sunset -> morning_dump")
+        _charge_mode = "morning_dump"
+        _dump_was_active = False
+        decision = compute_target(_charge_mode, pw, ev, settings)
+
+    _record_sample(pw, ev, _charge_mode, decision)
+
     if ev is None:
         return
     has_rate = decision.target_amps >= settings.ev_min_amps
@@ -171,6 +228,227 @@ def _control_tick() -> None:
         if not ev.on and (not has_rate or ev.charge_rate_a == decision.target_amps):
             return
     _apply_target(decision)
+
+
+def _chart_svg() -> str:
+    """24-hour rolling chart: actual solar production vs clear-sky theoretical."""
+    import time as _time
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo(settings.timezone)
+    now_dt = datetime.now(tz)
+    now_ts = int(_time.time())
+    # 24-hour window centered on now: 12 h past, 12 h future. The
+    # theoretical curve extends into the future (it's just astronomy);
+    # actual/SoC stop at now since we don't have future telemetry.
+    start_ts = now_ts - 12 * 3600
+    end_ts = now_ts + 12 * 3600
+
+    samples = _sample_store().read_range(start_ts, now_ts)
+
+    W, H = 900, 280
+    # Right pad widened to fit the "%" axis labels.
+    PAD_L, PAD_R, PAD_T, PAD_B = 50, 40, 12, 30
+    plot_w = W - PAD_L - PAD_R
+    plot_h = H - PAD_T - PAD_B
+
+    if not samples:
+        return (
+            f'<svg viewBox="0 0 {W} {H}" class="chart" '
+            f'xmlns="http://www.w3.org/2000/svg">'
+            f'<text x="{W//2}" y="{H//2}" text-anchor="middle" '
+            f'fill="var(--muted)" font-size="14">no data yet — gathering…</text>'
+            f'</svg>'
+        )
+
+    max_solar = max((s.solar_w or 0) for s in samples)
+    # Use the rated array capacity as a y-axis floor so the theoretical
+    # curve always fits even when DB samples are sparse.
+    rated_w = settings.solar_array_max_kw * 1000.0
+    y_max_kw = max(1, int(max(max_solar, rated_w) // 1000) + 1)
+
+    def x_for(ts: int) -> float:
+        return PAD_L + (ts - start_ts) / (end_ts - start_ts) * plot_w
+
+    def y_for(w: float) -> float:
+        return PAD_T + plot_h - (w / (y_max_kw * 1000)) * plot_h
+
+    def y_for_pct(pct: float) -> float:
+        return PAD_T + plot_h - (pct / 100.0) * plot_h
+
+    parts: list[str] = []
+
+    # Horizontal grid + LEFT Y labels (every 1 kW).
+    for kw in range(y_max_kw + 1):
+        y = y_for(kw * 1000)
+        parts.append(
+            f'<line x1="{PAD_L}" y1="{y:.1f}" x2="{W-PAD_R}" y2="{y:.1f}" '
+            f'stroke="#8884" stroke-dasharray="2 2"/>'
+            f'<text x="{PAD_L-6}" y="{y+4:.1f}" text-anchor="end" '
+            f'font-size="10" fill="var(--muted)">{kw} kW</text>'
+        )
+    # RIGHT Y labels (SOC %) — every 25%.
+    for pct in (0, 25, 50, 75, 100):
+        y = y_for_pct(pct)
+        parts.append(
+            f'<text x="{W-PAD_R+6}" y="{y+4:.1f}" text-anchor="start" '
+            f'font-size="10" fill="var(--muted)">{pct}%</text>'
+        )
+
+    # Vertical grid + X labels every 3 hours, aligned to clock. Spans the
+    # full 24 h window (12 h past + 12 h future).
+    aligned = now_dt.replace(minute=0, second=0, microsecond=0)
+    while aligned.hour % 3 != 0:
+        aligned -= timedelta(hours=1)
+    cur = aligned - timedelta(hours=12)
+    end_dt = now_dt + timedelta(hours=12)
+    while cur <= end_dt:
+        cur_ts = int(cur.timestamp())
+        if start_ts <= cur_ts <= end_ts:
+            x = x_for(cur_ts)
+            parts.append(
+                f'<line x1="{x:.1f}" y1="{PAD_T}" x2="{x:.1f}" y2="{H-PAD_B}" '
+                f'stroke="#8884" stroke-dasharray="2 2"/>'
+                f'<text x="{x:.1f}" y="{H-PAD_B+14}" text-anchor="middle" '
+                f'font-size="10" fill="var(--muted)">{cur:%H:%M}</text>'
+            )
+        cur += timedelta(hours=3)
+    # "Now" marker line in the middle of the chart.
+    now_x = x_for(now_ts)
+    parts.append(
+        f'<line x1="{now_x:.1f}" y1="{PAD_T}" x2="{now_x:.1f}" y2="{H-PAD_B}" '
+        f'stroke="currentColor" stroke-width="1" opacity="0.35"/>'
+    )
+
+    def series_polyline(getter, stroke: str) -> str:
+        # Break the polyline at gaps (NULL readings) so we don't connect
+        # across telemetry outages.
+        segments: list[list[tuple[float, float]]] = []
+        current: list[tuple[float, float]] = []
+        for s in samples:
+            v = getter(s)
+            if v is None or v < 0:
+                if current:
+                    segments.append(current)
+                    current = []
+            else:
+                current.append((x_for(s.ts), y_for(v)))
+        if current:
+            segments.append(current)
+        return "".join(
+            f'<polyline points="{" ".join(f"{x:.1f},{y:.1f}" for x, y in seg)}" '
+            f'fill="none" stroke="{stroke}" stroke-width="1.5"/>'
+            for seg in segments if len(seg) >= 2
+        )
+
+    # Theoretical curve: compute live across the full 24 h window so it's
+    # always visible regardless of how much real data we've accumulated.
+    # 5-minute granularity → 288 points, plenty smooth, microseconds to draw.
+    from datetime import timedelta as _td
+    from zoneinfo import ZoneInfo as _Z
+
+    tz_for_theo = _Z(settings.timezone)
+    step = 5 * 60
+    theo_pts: list[tuple[float, float]] = []
+    t = start_ts
+    while t <= end_ts:
+        w = theoretical_w(datetime.fromtimestamp(t, tz_for_theo), settings)
+        if w > 0:
+            theo_pts.append((x_for(t), y_for(w)))
+        elif theo_pts:
+            theo_pts.append((x_for(t), y_for(0.0)))
+        t += step
+    if len(theo_pts) >= 2:
+        pts_str = " ".join(f"{x:.1f},{y:.1f}" for x, y in theo_pts)
+        parts.append(
+            f'<polyline points="{pts_str}" fill="none" '
+            f'stroke="#d04545" stroke-width="1.5"/>'
+        )
+
+    # Actual solar: orange to match the solar node in the diagram above.
+    parts.append(series_polyline(lambda s: s.solar_w, "#e8a33d"))
+
+    # SOC: scaled to the right-side 0–100% axis, green to match battery node.
+    soc_segments: list[list[tuple[float, float]]] = []
+    cur: list[tuple[float, float]] = []
+    for s in samples:
+        if s.soc_pct is None:
+            if cur:
+                soc_segments.append(cur)
+                cur = []
+        else:
+            cur.append((x_for(s.ts), y_for_pct(s.soc_pct)))
+    if cur:
+        soc_segments.append(cur)
+    for seg in soc_segments:
+        if len(seg) < 2:
+            continue
+        pts = " ".join(f"{x:.1f},{y:.1f}" for x, y in seg)
+        parts.append(
+            f'<polyline points="{pts}" fill="none" '
+            f'stroke="#2ea56a" stroke-width="1.5"/>'
+        )
+
+    parts.append(
+        f'<text x="{PAD_L+8}" y="{PAD_T+14}" font-size="11">'
+        '<tspan fill="#d04545">━━ </tspan>'
+        '<tspan fill="currentColor">theoretical</tspan>'
+        '<tspan dx="14" fill="#e8a33d">━━ </tspan>'
+        '<tspan fill="currentColor">actual</tspan>'
+        '<tspan dx="14" fill="#2ea56a">━━ </tspan>'
+        '<tspan fill="currentColor">SoC</tspan>'
+        '</text>'
+    )
+
+    return (
+        f'<svg viewBox="0 0 {W} {H}" class="chart" '
+        f'xmlns="http://www.w3.org/2000/svg" role="img" '
+        f'aria-label="Solar production over the last 24 hours">'
+        + "".join(parts)
+        + '</svg>'
+    )
+
+
+def _record_sample(
+    pw: PowerReading | None,
+    ev: ChargerState | None,
+    mode: str,
+    decision: Decision,
+) -> None:
+    """Persist a telemetry sample for the chart and analytics queries."""
+    import time as _time
+    from zoneinfo import ZoneInfo
+
+    now_local = datetime.now(ZoneInfo(settings.timezone))
+    try:
+        theoretical = theoretical_w(now_local, settings)
+    except Exception:
+        theoretical = None
+    soc = pw.battery_soc_pct if pw else None
+    if soc is not None and math.isnan(soc):
+        soc = None
+    sample = Sample(
+        ts=int(_time.time()),
+        solar_w=pw.solar_w if pw else None,
+        load_w=pw.load_w if pw else None,
+        battery_w=pw.battery_w if pw else None,
+        grid_w=pw.grid_w if pw else None,
+        soc_pct=soc,
+        theoretical_w=theoretical,
+        charger_amps=ev.charge_rate_a if ev else None,
+        charger_on=ev.on if ev else None,
+        pw_ok=pw is not None,
+        em_ok=ev is not None,
+        mode=mode,
+        decision_amps=decision.target_amps,
+        decision_on=decision.on,
+        decision_reason=decision.reason,
+    )
+    try:
+        _sample_store().insert(sample)
+    except Exception:
+        logger.warning("sample insert failed", exc_info=False)
 
 
 async def _control_loop() -> None:
@@ -572,6 +850,7 @@ def _render(flash: str = "", flash_ok: bool = True, demo: str = "") -> str:
   body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 900px; margin: 2em auto; padding: 0 1em; --node-bg: #fff; }}
   @media (prefers-color-scheme: dark) {{ body {{ --node-bg: #1a1a1a; }} }}
   svg.flow {{ width: 100%; height: auto; max-width: 860px; display: block; margin: .5em auto 1.5em; }}
+  svg.chart {{ width: 100%; height: auto; max-width: 900px; display: block; margin: .25em auto 1em; }}
   svg.flow .node-title {{ font-size: 14px; font-weight: 600; fill: currentColor; }}
   svg.flow .node-value {{ font-size: 12px; fill: var(--muted); }}
   svg.flow .flow-label {{ font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; paint-order: stroke; stroke: var(--node-bg); stroke-width: 3px; }}
@@ -613,6 +892,9 @@ def _render(flash: str = "", flash_ok: bool = True, demo: str = "") -> str:
 {flash_html}
 
 {_flow_svg(pw, ev, consumers)}
+
+<h2>Solar — 24 h window (now centered)</h2>
+{_chart_svg()}
 
 <h2>Powerwall</h2>
 <table>{pw_rows}</table>

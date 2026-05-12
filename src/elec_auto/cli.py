@@ -56,6 +56,42 @@ def run() -> None:
 
 
 @app.command()
+def backfill(
+    days: int = typer.Option(2, help="Past days to backfill (e.g. 2 = yesterday + today)."),
+    step_sec: int = typer.Option(300, help="Sample interval in seconds (5 min default)."),
+) -> None:
+    """Seed `samples.theoretical_w` for past days from the astronomical model.
+
+    Useful for an empty/new DB so the chart and SQL queries have a
+    reference curve before real telemetry has accumulated. Doesn't touch
+    any other columns on existing rows.
+    """
+    from datetime import datetime, timedelta
+    from pathlib import Path
+    from zoneinfo import ZoneInfo
+
+    from .samples import SampleStore
+    from .solar import theoretical_w
+
+    if settings.latitude is None or settings.longitude is None:
+        typer.echo("LATITUDE / LONGITUDE not set in .env", err=True)
+        raise typer.Exit(code=1)
+
+    store = SampleStore(Path("state") / "samples.db")
+    tz = ZoneInfo(settings.timezone)
+    end = datetime.now(tz)
+    start = end - timedelta(days=days)
+
+    count = 0
+    t = start
+    while t <= end:
+        store.backfill_theoretical(int(t.timestamp()), theoretical_w(t, settings))
+        t += timedelta(seconds=step_sec)
+        count += 1
+    typer.echo(f"backfilled {count} theoretical samples ({days} days @ {step_sec}s)")
+
+
+@app.command()
 def serve(
     host: str = typer.Option("0.0.0.0", help="Bind address. Default exposes to LAN; no auth — keep off untrusted networks."),
     port: int = typer.Option(8000, help="Port for the web UI."),
