@@ -104,6 +104,53 @@ class Emporia:
         updated = self._vue.update_charger(parent.ev_charger, on=on)
         return self._state(parent, updated)
 
+    def all_circuit_loads(self, min_threshold_w: float = 0.0) -> dict[str, float]:
+        """Per-circuit watts for one snapshot, keyed by canonical label.
+
+        Labeling:
+          - Named channels (Oven, HVAC, etc.) keep their name.
+          - The panel monitor's synthetic "Main" channel becomes "Main".
+          - Sub-panels' "Main" gets the device's display name (e.g.,
+            "Garage Subpanel"). Same for the EVSE → "EV Charger".
+          - "Balance" (Main minus sum of monitored circuits) is skipped.
+          - Anything below `min_threshold_w` is also skipped.
+        """
+        devices = self._vue.get_devices()
+        gids = [d.device_gid for d in devices]
+        if not gids:
+            return {}
+
+        # Map each device gid to the label we'll use for its Main channel.
+        main_label: dict[int, str] = {}
+        for d in devices:
+            if d.ev_charger is not None:
+                main_label[d.device_gid] = (d.device_name or "EV Charger")
+            elif (d.device_name or "").strip():
+                main_label[d.device_gid] = d.device_name
+            else:
+                # The whole-panel monitor has no device name; that's "Main".
+                main_label.setdefault(d.device_gid, "Main")
+
+        usage = self._vue.get_device_list_usage(
+            gids, instant=datetime.now(timezone.utc), scale=Scale.MINUTE.value,
+        )
+        out: dict[str, float] = {}
+        for gid, dev in usage.items():
+            for ch in dev.channels.values():
+                raw_name = (ch.name or "").strip()
+                if raw_name == "Balance":
+                    continue
+                if raw_name == "Main":
+                    label = main_label.get(gid, "Main")
+                elif raw_name:
+                    label = raw_name
+                else:
+                    continue  # unnamed non-Main channel: skip
+                watts = float(ch.usage or 0.0) * _KWH_PER_MIN_TO_W
+                if watts > min_threshold_w:
+                    out[label] = watts
+        return out
+
     def top_consumers(self, n: int = 3) -> list[tuple[str, float]]:
         """Return top-N named circuits by instantaneous power draw, in watts.
 

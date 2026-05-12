@@ -95,6 +95,11 @@ class Settings(BaseSettings):
     # 3 be a dud?" planning. Solcast hobbyist allows up to 168 h.
     solcast_forecast_horizon_hours: int = Field(default=72, ge=24, le=168)
 
+    # Per-circuit load logging: a row goes into the `loads` table only when
+    # the channel's draw exceeds this threshold. Filters out noise on
+    # always-off circuits and keeps the DB compact.
+    load_log_threshold_w: float = Field(default=5.0, ge=0.0, le=100.0)
+
     # Time zone passed to pypowerwall for timestamp handling.
     timezone: str = "America/Los_Angeles"
 

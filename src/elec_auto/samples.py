@@ -58,6 +58,14 @@ CREATE TABLE IF NOT EXISTS forecasts (
     PRIMARY KEY (period_ts, fetched_at, source)
 );
 CREATE INDEX IF NOT EXISTS idx_forecasts_period ON forecasts(period_ts);
+CREATE TABLE IF NOT EXISTS loads (
+    ts      INTEGER NOT NULL,
+    circuit TEXT    NOT NULL,
+    watts   REAL    NOT NULL,
+    PRIMARY KEY (ts, circuit)
+);
+CREATE INDEX IF NOT EXISTS idx_loads_ts ON loads(ts);
+CREATE INDEX IF NOT EXISTS idx_loads_circuit ON loads(circuit);
 """
 
 # Columns added after the initial samples schema. Applied via ALTER TABLE
@@ -392,3 +400,50 @@ class ForecastStore:
                 (source, start_ts, end_ts),
             ).fetchall()
         return [Forecast(**dict(zip(_FORECAST_COLS, r))) for r in rows]
+
+
+@dataclass(slots=True)
+class CircuitReading:
+    ts: int
+    circuit: str
+    watts: float
+
+
+class LoadStore:
+    """Per-circuit load samples. Sparse — only rows with non-trivial draw."""
+
+    def __init__(self, db_path: Path) -> None:
+        self._db_path = db_path
+        _init_db(db_path)
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self._db_path, isolation_level=None, timeout=5.0)
+
+    def insert_tick(self, ts: int, circuits: dict[str, float]) -> None:
+        """Insert one tick of circuit readings. `circuits` should already be
+        filtered to non-zero entries by the caller."""
+        rows = [(ts, name, float(watts)) for name, watts in circuits.items()]
+        if not rows:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO loads (ts, circuit, watts) VALUES (?, ?, ?)",
+                rows,
+            )
+
+    def read_range(
+        self,
+        start_ts: int,
+        end_ts: int,
+        circuit: str | None = None,
+    ) -> list[CircuitReading]:
+        """All non-zero readings in [start_ts, end_ts], optionally filtered."""
+        query = "SELECT ts, circuit, watts FROM loads WHERE ts BETWEEN ? AND ?"
+        args: tuple = (start_ts, end_ts)
+        if circuit is not None:
+            query += " AND circuit = ?"
+            args = (start_ts, end_ts, circuit)
+        query += " ORDER BY ts, circuit"
+        with self._connect() as conn:
+            rows = conn.execute(query, args).fetchall()
+        return [CircuitReading(ts=r[0], circuit=r[1], watts=r[2]) for r in rows]

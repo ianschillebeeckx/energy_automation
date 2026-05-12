@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import html
 import math
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Annotated
@@ -23,7 +24,7 @@ from .emporia import ChargerState, Emporia
 from .flow import Flows, decompose
 from .policy import Decision
 from .powerwall import Powerwall, PowerReading
-from .samples import Forecast, ForecastStore, Sample, SampleStore
+from .samples import Forecast, ForecastStore, LoadStore, Sample, SampleStore
 from .solar import theoretical_w
 from .solcast import Solcast, daily_schedule
 
@@ -55,6 +56,7 @@ _pw: Powerwall | None = None
 _em: Emporia | None = None
 _samples: SampleStore | None = None
 _forecasts: ForecastStore | None = None
+_loads: LoadStore | None = None
 
 
 def _db_path():
@@ -74,6 +76,13 @@ def _forecast_store() -> ForecastStore:
     if _forecasts is None:
         _forecasts = ForecastStore(_db_path())
     return _forecasts
+
+
+def _load_store() -> LoadStore:
+    global _loads
+    if _loads is None:
+        _loads = LoadStore(_db_path())
+    return _loads
 
 _CHARGE_MODES: dict[str, str] = {
     "surplus":      "Surplus solar",
@@ -234,6 +243,7 @@ def _control_tick() -> None:
         decision = compute_target(_charge_mode, pw, ev, settings)
 
     _record_sample(pw, ev, _charge_mode, decision)
+    _record_loads(int(time.time()))
 
     if ev is None:
         return
@@ -248,15 +258,243 @@ def _control_tick() -> None:
     _apply_target(decision)
 
 
+# Channels we treat as roll-ups, not individual circuits. The per-circuit
+# chart skips these because they double-count (Main = sum of everything;
+# Garage Subpanel = sum of its branches; EV Charger has its own diagram
+# node) and they'd otherwise dominate the y-axis.
+_AGGREGATE_CIRCUITS = {"Main", "Garage Subpanel", "EV Charger", "Balance"}
+
+# Color palette for circuit polylines. Assigned in sorted-name order so
+# the same circuit gets the same color across page reloads. Sourced from
+# matplotlib's tab20 + a couple of extras for 17 distinct colors.
+_CIRCUIT_PALETTE = [
+    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+    "#aec7e8", "#ffbb78", "#98df8a", "#ff9896", "#c5b0d5",
+    "#c49c94", "#f7b6d2",
+]
+
+
+def _nice_y_axis(max_value: float, target_ticks: int = 8) -> tuple[float, float]:
+    """Pick a 'nice' step (1, 2, 2.5, 5 × 10^n) and an axis max above `max_value`.
+
+    Returns (step, axis_max) in the same units as `max_value`. Standard chart
+    axis algorithm — yields steps like 100, 200, 250, 500, 1000, 2500, ...
+    """
+    if max_value <= 0:
+        return 100.0, 100.0
+    rough = max_value / target_ticks
+    magnitude = 10 ** math.floor(math.log10(rough))
+    norm = rough / magnitude
+    if norm < 1.5:
+        nice = 1.0
+    elif norm < 2.25:
+        nice = 2.0
+    elif norm < 3.75:
+        nice = 2.5
+    elif norm < 7.5:
+        nice = 5.0
+    else:
+        nice = 10.0
+    step = nice * magnitude
+    axis_max = math.ceil(max_value / step) * step
+    return step, axis_max
+
+
+def _fmt_y_label(w: float, step_w: float) -> str:
+    """Numeric Y-axis tick label (unit goes in the axis title)."""
+    if step_w >= 1000:
+        return f"{w/1000:g}"
+    return f"{int(round(w))}"
+
+
+def _pack_legend_rows(
+    names: list[str], available_px: float,
+    char_px: float = 6.0, dash_px: float = 20.0, gap_px: float = 10.0,
+) -> list[list[str]]:
+    """Greedy-pack circuit names into rows that fit `available_px` wide.
+
+    Width estimates are rough — SVG text width depends on the font and
+    glyph mix, but ~6px per char at 11pt matches typical UI fonts well
+    enough for this layout.
+    """
+    rows: list[list[str]] = []
+    current: list[str] = []
+    width = 0.0
+    for name in names:
+        item_w = dash_px + len(name) * char_px + (gap_px if current else 0)
+        if current and width + item_w > available_px:
+            rows.append(current)
+            current = []
+            width = 0
+            item_w = dash_px + len(name) * char_px
+        current.append(name)
+        width += item_w
+    if current:
+        rows.append(current)
+    return rows
+
+
+def _circuits_section() -> str:
+    """SVG chart + legend for per-circuit usage. Same 24 h window centered on
+    "now" as the system chart, so the two line up visually."""
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+
+    now_ts = int(time.time())
+    start_ts = now_ts - 12 * 3600
+    end_ts = now_ts + 12 * 3600
+
+    rows = [
+        r for r in _load_store().read_range(start_ts, now_ts)
+        if r.circuit not in _AGGREGATE_CIRCUITS
+    ]
+
+    W, H = 900, 240
+    PAD_L, PAD_R, PAD_B = 50, 12, 30
+    plot_w = W - PAD_L - PAD_R
+
+    if not rows:
+        PAD_T = 26
+        plot_h = H - PAD_T - PAD_B
+        return (
+            f'<svg viewBox="0 0 {W} {H}" class="chart" '
+            f'xmlns="http://www.w3.org/2000/svg">'
+            f'<text x="{W//2}" y="{H//2}" text-anchor="middle" '
+            f'fill="var(--muted)" font-size="14">'
+            f'no circuit data yet — gathering…</text></svg>'
+        )
+
+    by_circuit: dict[str, list[tuple[int, float]]] = {}
+    for r in rows:
+        by_circuit.setdefault(r.circuit, []).append((r.ts, r.watts))
+
+    max_w = max(max(w for _, w in pts) for pts in by_circuit.values())
+    step_w, y_max_w = _nice_y_axis(max_w, target_ticks=8)
+
+    name_color = {
+        name: _CIRCUIT_PALETTE[i % len(_CIRCUIT_PALETTE)]
+        for i, name in enumerate(sorted(by_circuit))
+    }
+
+    # Pack legend into rows that fit the chart width. Sorted by total energy
+    # so the heaviest circuits appear first.
+    energy = {n: sum(w for _, w in by_circuit[n]) for n in by_circuit}
+    legend_order = sorted(by_circuit, key=lambda n: energy[n], reverse=True)
+    legend_rows = _pack_legend_rows(legend_order, available_px=plot_w - 8)
+
+    LEGEND_LINE_PX = 14
+    AXIS_TITLE_ROW_PX = 16
+    PAD_T = AXIS_TITLE_ROW_PX + len(legend_rows) * LEGEND_LINE_PX + 6
+    plot_h = H - PAD_T - PAD_B
+
+    def x_for(ts: int) -> float:
+        return PAD_L + (ts - start_ts) / (end_ts - start_ts) * plot_w
+
+    def y_for(w: float) -> float:
+        return PAD_T + plot_h - (w / y_max_w) * plot_h
+
+    parts: list[str] = []
+
+    # Axis title (unit only) at the top.
+    unit_label = "kW" if step_w >= 1000 else "W"
+    parts.append(
+        f'<text x="{PAD_L-6}" y="10" text-anchor="end" '
+        f'font-size="10" fill="var(--muted)">{unit_label}</text>'
+    )
+    # In-plot legend rows, one <text> per row.
+    for row_idx, row in enumerate(legend_rows):
+        y = AXIS_TITLE_ROW_PX + 4 + row_idx * LEGEND_LINE_PX
+        tspans = []
+        for i, name in enumerate(row):
+            spacer = '<tspan dx="10"> </tspan>' if i > 0 else ""
+            tspans.append(
+                f'{spacer}<tspan fill="{name_color[name]}">━━ </tspan>'
+                f'<tspan fill="currentColor">{html.escape(name)}</tspan>'
+            )
+        parts.append(
+            f'<text x="{PAD_L+4}" y="{y}" font-size="11">'
+            + "".join(tspans) + '</text>'
+        )
+    # Y gridlines + labels using the nice step.
+    n_ticks = int(y_max_w / step_w)
+    for i in range(n_ticks + 1):
+        w = i * step_w
+        y = y_for(w)
+        parts.append(
+            f'<line x1="{PAD_L}" y1="{y:.1f}" x2="{W-PAD_R}" y2="{y:.1f}" '
+            f'stroke="#8884" stroke-dasharray="2 2"/>'
+            f'<text x="{PAD_L-6}" y="{y+4:.1f}" text-anchor="end" '
+            f'font-size="10" fill="var(--muted)">{_fmt_y_label(w, step_w)}</text>'
+        )
+
+    # X grid + labels every 3 hours, full 24 h centered on now.
+    tz = ZoneInfo(settings.timezone)
+    now_dt = datetime.fromtimestamp(now_ts, tz)
+    aligned = now_dt.replace(minute=0, second=0, microsecond=0)
+    while aligned.hour % 3 != 0:
+        aligned -= timedelta(hours=1)
+    cur = aligned - timedelta(hours=12)
+    end_dt = now_dt + timedelta(hours=12)
+    while cur <= end_dt:
+        cur_ts = int(cur.timestamp())
+        if start_ts <= cur_ts <= end_ts:
+            x = x_for(cur_ts)
+            parts.append(
+                f'<line x1="{x:.1f}" y1="{PAD_T}" x2="{x:.1f}" y2="{H-PAD_B}" '
+                f'stroke="#8884" stroke-dasharray="2 2"/>'
+                f'<text x="{x:.1f}" y="{H-PAD_B+14}" text-anchor="middle" '
+                f'font-size="10" fill="var(--muted)">{cur:%H:%M}</text>'
+            )
+        cur += timedelta(hours=3)
+    # "Now" marker matching the system chart.
+    now_x = x_for(now_ts)
+    parts.append(
+        f'<line x1="{now_x:.1f}" y1="{PAD_T}" x2="{now_x:.1f}" y2="{H-PAD_B}" '
+        f'stroke="currentColor" stroke-width="1" opacity="0.35"/>'
+    )
+
+    # One polyline per circuit, broken at telemetry gaps (>90 s between samples).
+    for circuit in sorted(by_circuit):
+        pts = sorted(by_circuit[circuit])
+        color = name_color[circuit]
+        segments: list[list[tuple[float, float]]] = []
+        cur_seg: list[tuple[float, float]] = []
+        prev_ts = None
+        for ts, w in pts:
+            if prev_ts is not None and ts - prev_ts > 90:
+                if len(cur_seg) >= 2:
+                    segments.append(cur_seg)
+                cur_seg = []
+            cur_seg.append((x_for(ts), y_for(w)))
+            prev_ts = ts
+        if cur_seg:
+            segments.append(cur_seg)
+        for seg in segments:
+            if len(seg) < 2:
+                continue
+            pts_str = " ".join(f"{x:.1f},{y:.1f}" for x, y in seg)
+            parts.append(
+                f'<polyline points="{pts_str}" fill="none" stroke="{color}" '
+                f'stroke-width="1.5"/>'
+            )
+
+    return (
+        f'<svg viewBox="0 0 {W} {H}" class="chart" '
+        f'xmlns="http://www.w3.org/2000/svg">'
+        + "".join(parts) + '</svg>'
+    )
+
+
 def _chart_heading() -> str:
-    """`<h2>` for the chart, appending the current qualitative weather if known."""
+    """`<h2>` for the system chart, appending the current qualitative weather."""
     try:
         label = _forecast_store().current_qualitative()
     except Exception:
         label = None
     if label:
-        return f"<h2>24 hour diagnostics ({html.escape(label)})</h2>"
-    return "<h2>24 hour diagnostics</h2>"
+        return f"<h2>System ({html.escape(label)})</h2>"
+    return "<h2>System</h2>"
 
 
 def _chart_svg() -> str:
@@ -278,7 +516,8 @@ def _chart_svg() -> str:
 
     W, H = 900, 280
     # Right pad widened to fit the "%" axis labels.
-    PAD_L, PAD_R, PAD_T, PAD_B = 50, 40, 12, 30
+    # Top pad widened to give the axis-title row room above the gridlines.
+    PAD_L, PAD_R, PAD_T, PAD_B = 50, 40, 26, 30
     plot_w = W - PAD_L - PAD_R
     plot_h = H - PAD_T - PAD_B
 
@@ -292,10 +531,12 @@ def _chart_svg() -> str:
         )
 
     max_solar = max((s.solar_w or 0) for s in samples)
+    max_load = max((s.load_w or 0) for s in samples)
     # Use the rated array capacity as a y-axis floor so the theoretical
-    # curve always fits even when DB samples are sparse.
+    # curve always fits even when DB samples are sparse. Also include
+    # home load — a Tesla pulling 9.6 kW from grid can outstrip rated PV.
     rated_w = settings.solar_array_max_kw * 1000.0
-    y_max_kw = max(1, int(max(max_solar, rated_w) // 1000) + 1)
+    y_max_kw = max(1, int(max(max_solar, max_load, rated_w) // 1000) + 1)
 
     def x_for(ts: int) -> float:
         return PAD_L + (ts - start_ts) / (end_ts - start_ts) * plot_w
@@ -308,21 +549,27 @@ def _chart_svg() -> str:
 
     parts: list[str] = []
 
-    # Horizontal grid + LEFT Y labels (every 1 kW).
+    # Axis titles (units), placed above the top gridline.
+    parts.append(
+        f'<text x="{PAD_L-6}" y="{PAD_T-8}" text-anchor="end" '
+        f'font-size="10" fill="var(--muted)">kW</text>'
+        f'<text x="{W-PAD_R+6}" y="{PAD_T-8}" text-anchor="start" '
+        f'font-size="10" fill="var(--muted)">%</text>'
+    )
+    # Horizontal grid + LEFT (kW) + RIGHT (SoC %) labels.
+    # Both axes share the same gridlines: 0..y_max_kw kW maps linearly to
+    # 0..100% SoC, so the right-axis label at each gridline is just the
+    # gridline's fraction of full scale.
     for kw in range(y_max_kw + 1):
         y = y_for(kw * 1000)
+        pct = (kw / y_max_kw) * 100.0
         parts.append(
             f'<line x1="{PAD_L}" y1="{y:.1f}" x2="{W-PAD_R}" y2="{y:.1f}" '
             f'stroke="#8884" stroke-dasharray="2 2"/>'
             f'<text x="{PAD_L-6}" y="{y+4:.1f}" text-anchor="end" '
-            f'font-size="10" fill="var(--muted)">{kw} kW</text>'
-        )
-    # RIGHT Y labels (SOC %) — every 25%.
-    for pct in (0, 25, 50, 75, 100):
-        y = y_for_pct(pct)
-        parts.append(
+            f'font-size="10" fill="var(--muted)">{kw}</text>'
             f'<text x="{W-PAD_R+6}" y="{y+4:.1f}" text-anchor="start" '
-            f'font-size="10" fill="var(--muted)">{pct}%</text>'
+            f'font-size="10" fill="var(--muted)">{pct:.0f}</text>'
         )
 
     # Vertical grid + X labels every 3 hours, aligned to clock. Spans the
@@ -395,6 +642,8 @@ def _chart_svg() -> str:
             f'stroke="#d04545" stroke-width="1.5"/>'
         )
 
+    # Home load: grey to match the home node in the diagram above.
+    parts.append(series_polyline(lambda s: s.load_w, "#888888"))
     # Actual solar: orange to match the solar node in the diagram above.
     parts.append(series_polyline(lambda s: s.solar_w, "#e8a33d"))
     # Solcast forecast: dashed teal so it reads as "predicted" rather than
@@ -455,6 +704,8 @@ def _chart_svg() -> str:
         '<tspan fill="currentColor">actual</tspan>'
         '<tspan dx="14" fill="#3aa5c7">┅┅ </tspan>'
         '<tspan fill="currentColor">forecast</tspan>'
+        '<tspan dx="14" fill="#888888">━━ </tspan>'
+        '<tspan fill="currentColor">load</tspan>'
         '<tspan dx="14" fill="#2ea56a">━━ </tspan>'
         '<tspan fill="currentColor">SoC</tspan>'
         '</text>'
@@ -467,6 +718,27 @@ def _chart_svg() -> str:
         + "".join(parts)
         + '</svg>'
     )
+
+
+def _record_loads(ts: int) -> None:
+    """Snapshot non-zero per-circuit loads from Emporia and write to the DB.
+
+    Independent of `_record_sample` so a brief Emporia outage doesn't
+    block the main telemetry write. Best-effort: errors are logged and
+    swallowed.
+    """
+    try:
+        em = _emporia()
+        loads = em.all_circuit_loads(min_threshold_w=settings.load_log_threshold_w)
+    except Exception:
+        logger.warning("emporia circuit loads read failed", exc_info=False)
+        return
+    if not loads:
+        return
+    try:
+        _load_store().insert_tick(ts, loads)
+    except Exception:
+        logger.warning("loads insert failed", exc_info=False)
 
 
 def _record_sample(
@@ -972,6 +1244,9 @@ def _render(flash: str = "", flash_ok: bool = True, demo: str = "") -> str:
   @media (prefers-color-scheme: dark) {{ body {{ --node-bg: #1a1a1a; }} }}
   svg.flow {{ width: 100%; height: auto; max-width: 860px; display: block; margin: .5em auto 1.5em; }}
   svg.chart {{ width: 100%; height: auto; max-width: 900px; display: block; margin: .25em auto 1em; }}
+  .circuits-legend {{ display: flex; flex-wrap: wrap; gap: .35em 1em; font-size: 12px; margin: 0 .5em 1.5em; max-width: 900px; }}
+  .circuits-legend .leg-item {{ white-space: nowrap; color: var(--muted); }}
+  .circuits-legend .leg-dot {{ display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: .35em; vertical-align: middle; }}
   svg.flow .node-title {{ font-size: 14px; font-weight: 600; fill: currentColor; }}
   svg.flow .node-value {{ font-size: 12px; fill: var(--muted); }}
   svg.flow .flow-label {{ font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; paint-order: stroke; stroke: var(--node-bg); stroke-width: 3px; }}
@@ -1016,6 +1291,9 @@ def _render(flash: str = "", flash_ok: bool = True, demo: str = "") -> str:
 
 {_chart_heading()}
 {_chart_svg()}
+
+<h2>Usage</h2>
+{_circuits_section()}
 
 <h2>Powerwall</h2>
 <table>{pw_rows}</table>

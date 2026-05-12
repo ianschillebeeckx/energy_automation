@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from elec_auto.samples import Forecast, ForecastStore, Sample, SampleStore
+from elec_auto.samples import (
+    CircuitReading, Forecast, ForecastStore, LoadStore, Sample, SampleStore,
+)
 
 
 def _store(tmp_path: Path) -> SampleStore:
@@ -165,3 +167,44 @@ def test_forecast_source_filter(tmp_path: Path) -> None:
     assert row.pv_w_p50 == 1.0
     [row] = fs.latest_in_range(0, 2000, source="other")
     assert row.pv_w_p50 == 2.0
+
+
+# --- LoadStore --------------------------------------------------------------
+
+def test_load_round_trip(tmp_path: Path) -> None:
+    ls = LoadStore(tmp_path / "samples.db")
+    ls.insert_tick(1000, {"Oven": 3800.0, "HVAC": 200.0, "Main": 4500.0})
+    rows = ls.read_range(0, 2000)
+    by_circuit = {r.circuit: r.watts for r in rows}
+    assert by_circuit == {"Oven": 3800.0, "HVAC": 200.0, "Main": 4500.0}
+
+
+def test_load_skips_empty_dict(tmp_path: Path) -> None:
+    ls = LoadStore(tmp_path / "samples.db")
+    ls.insert_tick(1000, {})  # no-op
+    assert ls.read_range(0, 2000) == []
+
+
+def test_load_range_filter(tmp_path: Path) -> None:
+    ls = LoadStore(tmp_path / "samples.db")
+    for t in [10, 20, 30, 40]:
+        ls.insert_tick(t, {"Oven": float(t * 100)})
+    rows = ls.read_range(15, 35)
+    assert [(r.ts, r.watts) for r in rows] == [(20, 2000.0), (30, 3000.0)]
+
+
+def test_load_circuit_filter(tmp_path: Path) -> None:
+    ls = LoadStore(tmp_path / "samples.db")
+    ls.insert_tick(1000, {"Oven": 3800.0, "HVAC": 200.0})
+    ls.insert_tick(1030, {"Oven": 0.0001, "HVAC": 200.0})
+    rows = ls.read_range(0, 2000, circuit="HVAC")
+    assert {r.ts for r in rows} == {1000, 1030}
+    assert all(r.circuit == "HVAC" for r in rows)
+
+
+def test_load_insert_or_replace_same_pk(tmp_path: Path) -> None:
+    ls = LoadStore(tmp_path / "samples.db")
+    ls.insert_tick(1000, {"Oven": 100.0})
+    ls.insert_tick(1000, {"Oven": 200.0})  # same (ts, circuit)
+    [row] = ls.read_range(0, 2000)
+    assert row.watts == 200.0
