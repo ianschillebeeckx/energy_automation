@@ -23,24 +23,30 @@ from .emporia import ChargerState, Emporia
 from .flow import Flows, decompose
 from .policy import Decision
 from .powerwall import Powerwall, PowerReading
-from .samples import Sample, SampleStore
+from .samples import Forecast, ForecastStore, Sample, SampleStore
 from .solar import theoretical_w
+from .solcast import Solcast, daily_schedule
 
 
 @asynccontextmanager
 async def _lifespan(app_: FastAPI):
     loop = asyncio.get_running_loop()
-    task = loop.create_task(_control_loop())
+    tasks = [loop.create_task(_control_loop())]
     logger.info("control loop started (mode={}, interval={}s)",
                 _charge_mode, settings.poll_interval_sec)
+    if settings.solcast_api_key and settings.solcast_resource_id:
+        tasks.append(loop.create_task(_forecast_loop()))
+        logger.info("solcast forecast loop started")
     try:
         yield
     finally:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        for t in tasks:
+            t.cancel()
+        for t in tasks:
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(title="elec_auto", docs_url=None, redoc_url=None, lifespan=_lifespan)
@@ -48,14 +54,26 @@ app = FastAPI(title="elec_auto", docs_url=None, redoc_url=None, lifespan=_lifesp
 _pw: Powerwall | None = None
 _em: Emporia | None = None
 _samples: SampleStore | None = None
+_forecasts: ForecastStore | None = None
+
+
+def _db_path():
+    from pathlib import Path
+    return Path("state") / "samples.db"
 
 
 def _sample_store() -> SampleStore:
     global _samples
     if _samples is None:
-        from pathlib import Path
-        _samples = SampleStore(Path("state") / "samples.db")
+        _samples = SampleStore(_db_path())
     return _samples
+
+
+def _forecast_store() -> ForecastStore:
+    global _forecasts
+    if _forecasts is None:
+        _forecasts = ForecastStore(_db_path())
+    return _forecasts
 
 _CHARGE_MODES: dict[str, str] = {
     "surplus":      "Surplus solar",
@@ -230,6 +248,17 @@ def _control_tick() -> None:
     _apply_target(decision)
 
 
+def _chart_heading() -> str:
+    """`<h2>` for the chart, appending the current qualitative weather if known."""
+    try:
+        label = _forecast_store().current_qualitative()
+    except Exception:
+        label = None
+    if label:
+        return f"<h2>24 hour diagnostics ({html.escape(label)})</h2>"
+    return "<h2>24 hour diagnostics</h2>"
+
+
 def _chart_svg() -> str:
     """24-hour rolling chart: actual solar production vs clear-sky theoretical."""
     import time as _time
@@ -368,6 +397,34 @@ def _chart_svg() -> str:
 
     # Actual solar: orange to match the solar node in the diagram above.
     parts.append(series_polyline(lambda s: s.solar_w, "#e8a33d"))
+    # Solcast forecast: dashed teal so it reads as "predicted" rather than
+    # measured. Spans the full window (past forecasts that we kept + future
+    # predictions for the right half).
+    store = _forecast_store()
+    # Use the *operational* view: at each period, the forecast that was
+    # most recent as of that period's own timestamp. For future periods
+    # this is the latest fetch; for past periods it's the version that was
+    # active at the time — without the benefit of later refinements.
+    forecasts = store.operational_in_range(start_ts, end_ts)
+    if len(forecasts) >= 2:
+        pts = " ".join(
+            f"{x_for(f.period_ts):.1f},{y_for(f.pv_w_p50):.1f}"
+            for f in forecasts if f.pv_w_p50 is not None
+        )
+        if pts:
+            parts.append(
+                f'<polyline points="{pts}" fill="none" stroke="#3aa5c7" '
+                f'stroke-width="1.5" stroke-dasharray="4 3"/>'
+            )
+    # Markers at each refresh event so we can eyeball how often the forecast
+    # actually updated. Y comes from the forecast itself at fetch time.
+    for fetched_at, pv in store.fetch_events(start_ts, end_ts):
+        if pv is None:
+            continue
+        parts.append(
+            f'<circle cx="{x_for(fetched_at):.1f}" cy="{y_for(pv):.1f}" '
+            f'r="3" fill="#3aa5c7"/>'
+        )
 
     # SOC: scaled to the right-side 0–100% axis, green to match battery node.
     soc_segments: list[list[tuple[float, float]]] = []
@@ -396,6 +453,8 @@ def _chart_svg() -> str:
         '<tspan fill="currentColor">theoretical</tspan>'
         '<tspan dx="14" fill="#e8a33d">━━ </tspan>'
         '<tspan fill="currentColor">actual</tspan>'
+        '<tspan dx="14" fill="#3aa5c7">┅┅ </tspan>'
+        '<tspan fill="currentColor">forecast</tspan>'
         '<tspan dx="14" fill="#2ea56a">━━ </tspan>'
         '<tspan fill="currentColor">SoC</tspan>'
         '</text>'
@@ -449,6 +508,68 @@ def _record_sample(
         _sample_store().insert(sample)
     except Exception:
         logger.warning("sample insert failed", exc_info=False)
+
+
+def _fetch_forecast() -> None:
+    try:
+        client = Solcast(settings)
+        rows = client.fetch(hours=settings.solcast_forecast_horizon_hours)
+    except Exception:
+        logger.exception("solcast forecast fetch failed")
+        return
+    _forecast_store().insert_many(rows)
+    logger.info("solcast forecast: stored {} periods ({}h horizon)",
+                len(rows), settings.solcast_forecast_horizon_hours)
+
+
+async def _forecast_loop() -> None:
+    """Strategically scheduled Solcast fetches.
+
+    Plan (per day): one fetch at 05:00 local + seven evenly spaced between
+    sunrise and sunset = 8 total. The 10/day hobbyist budget leaves 2
+    calls in reserve for retries / debugging. On startup we skip the
+    initial fetch if the most recent stored fetch is younger than
+    `solcast_skip_recent_minutes` — guards the budget across rapid
+    restart cycles.
+    """
+    import time as _time
+    from zoneinfo import ZoneInfo
+
+    loop = asyncio.get_running_loop()
+    tz = ZoneInfo(settings.timezone)
+
+    last = _forecast_store().last_fetched_at()
+    if last is not None:
+        age_min = (_time.time() - last) / 60.0
+        if age_min < settings.solcast_skip_recent_minutes:
+            logger.info(
+                "solcast: skipping startup fetch (last was {:.0f} min ago < {} min)",
+                age_min, settings.solcast_skip_recent_minutes,
+            )
+        else:
+            await loop.run_in_executor(None, _fetch_forecast)
+    else:
+        await loop.run_in_executor(None, _fetch_forecast)
+
+    while True:
+        now = datetime.now(tz)
+        slots = daily_schedule(now, settings.latitude, settings.longitude)
+        future = [t for t in slots if t > now]
+        if future:
+            next_t = min(future)
+        else:
+            # All of today's slots have passed; sleep until tomorrow's 5 AM.
+            from datetime import timedelta
+            next_t = (now + timedelta(days=1)).replace(
+                hour=5, minute=0, second=0, microsecond=0,
+            )
+        sleep_sec = max(1.0, (next_t - now).total_seconds())
+        logger.info(
+            "solcast: next fetch at {} (in {:.0f} min)",
+            next_t.strftime("%H:%M"), sleep_sec / 60.0,
+        )
+        await asyncio.sleep(sleep_sec)
+        await loop.run_in_executor(None, _fetch_forecast)
 
 
 async def _control_loop() -> None:
@@ -893,7 +1014,7 @@ def _render(flash: str = "", flash_ok: bool = True, demo: str = "") -> str:
 
 {_flow_svg(pw, ev, consumers)}
 
-<h2>Solar — 24 h window (now centered)</h2>
+{_chart_heading()}
 {_chart_svg()}
 
 <h2>Powerwall</h2>

@@ -24,7 +24,6 @@ CREATE TABLE IF NOT EXISTS samples (
     grid_w          REAL,
     soc_pct         REAL,
     theoretical_w   REAL,
-    forecast_w      REAL,
     charger_amps    INTEGER,
     charger_on      INTEGER,
     pw_ok           INTEGER,
@@ -34,12 +33,37 @@ CREATE TABLE IF NOT EXISTS samples (
     decision_on     INTEGER,
     decision_reason TEXT
 );
+CREATE TABLE IF NOT EXISTS forecasts (
+    period_ts                    INTEGER NOT NULL,
+    fetched_at                   INTEGER NOT NULL,
+    source                       TEXT    NOT NULL,
+    pv_w_p10                     REAL,
+    pv_w_p50                     REAL,
+    pv_w_p90                     REAL,
+    ghi_w_per_m2                 REAL,
+    ghi_w_per_m2_p10             REAL,
+    ghi_w_per_m2_p90             REAL,
+    dni_w_per_m2                 REAL,
+    dni_w_per_m2_p10             REAL,
+    dni_w_per_m2_p90             REAL,
+    dhi_w_per_m2                 REAL,
+    air_temp_c                   REAL,
+    cloud_opacity_pct            REAL,
+    relative_humidity_pct        REAL,
+    surface_pressure_hpa         REAL,
+    precipitable_water_kg_per_m2 REAL,
+    wind_speed_m_per_s           REAL,
+    wind_direction_deg           REAL,
+    weather                      TEXT,
+    PRIMARY KEY (period_ts, fetched_at, source)
+);
+CREATE INDEX IF NOT EXISTS idx_forecasts_period ON forecasts(period_ts);
 """
 
-# Columns added after the initial schema. Applied via ALTER TABLE for
-# existing DBs; no-op for fresh installs (the column already exists from
-# the CREATE TABLE above).
-_MIGRATIONS: list[tuple[str, str]] = [
+# Columns added after the initial samples schema. Applied via ALTER TABLE
+# for existing DBs; no-op for fresh installs (the columns are already in
+# CREATE TABLE above).
+_SAMPLES_MIGRATIONS: list[tuple[str, str]] = [
     ("pw_ok", "INTEGER"),
     ("em_ok", "INTEGER"),
     ("mode", "TEXT"),
@@ -47,6 +71,25 @@ _MIGRATIONS: list[tuple[str, str]] = [
     ("decision_on", "INTEGER"),
     ("decision_reason", "TEXT"),
 ]
+
+
+def _init_db(db_path: Path) -> None:
+    """Create the schema if missing and apply forward migrations. Idempotent."""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path, isolation_level=None, timeout=5.0) as conn:
+        conn.executescript(_SCHEMA)
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(samples)")}
+        for col, sql_type in _SAMPLES_MIGRATIONS:
+            if col not in existing:
+                conn.execute(f"ALTER TABLE samples ADD COLUMN {col} {sql_type}")
+        # Legacy: forecasts used to live as samples.forecast_w; they're now in
+        # their own table. Drop the column on existing DBs (SQLite 3.35+).
+        if "forecast_w" in existing:
+            try:
+                conn.execute("ALTER TABLE samples DROP COLUMN forecast_w")
+            except sqlite3.OperationalError:
+                # Older SQLite: leave the column alone; it just stays NULL.
+                pass
 
 
 @dataclass(slots=True)
@@ -58,7 +101,6 @@ class Sample:
     grid_w: float | None
     soc_pct: float | None
     theoretical_w: float | None
-    forecast_w: float | None = None
     charger_amps: int | None = None
     charger_on: bool | None = None
     pw_ok: bool | None = None
@@ -69,16 +111,36 @@ class Sample:
     decision_reason: str | None = None
 
 
+@dataclass(slots=True)
+class Forecast:
+    """One 30-minute forecast period from a weather/PV provider."""
+    period_ts: int                       # period midpoint, unix seconds
+    fetched_at: int                      # when we fetched, unix seconds
+    source: str                          # 'solcast', 'forecast.solar', etc.
+    pv_w_p10: float | None = None
+    pv_w_p50: float | None = None
+    pv_w_p90: float | None = None
+    ghi_w_per_m2: float | None = None
+    ghi_w_per_m2_p10: float | None = None
+    ghi_w_per_m2_p90: float | None = None
+    dni_w_per_m2: float | None = None
+    dni_w_per_m2_p10: float | None = None
+    dni_w_per_m2_p90: float | None = None
+    dhi_w_per_m2: float | None = None
+    air_temp_c: float | None = None
+    cloud_opacity_pct: float | None = None
+    relative_humidity_pct: float | None = None
+    surface_pressure_hpa: float | None = None
+    precipitable_water_kg_per_m2: float | None = None
+    wind_speed_m_per_s: float | None = None
+    wind_direction_deg: float | None = None
+    weather: str | None = None
+
+
 class SampleStore:
     def __init__(self, db_path: Path) -> None:
         self._db_path = db_path
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
-            conn.executescript(_SCHEMA)
-            existing = {row[1] for row in conn.execute("PRAGMA table_info(samples)")}
-            for col, sql_type in _MIGRATIONS:
-                if col not in existing:
-                    conn.execute(f"ALTER TABLE samples ADD COLUMN {col} {sql_type}")
+        _init_db(db_path)
 
     def _connect(self) -> sqlite3.Connection:
         # isolation_level=None: autocommit, simpler for our write-only-from-
@@ -94,14 +156,14 @@ class SampleStore:
                 """
                 INSERT OR REPLACE INTO samples
                 (ts, solar_w, load_w, battery_w, grid_w, soc_pct,
-                 theoretical_w, forecast_w, charger_amps, charger_on,
+                 theoretical_w, charger_amps, charger_on,
                  pw_ok, em_ok, mode, decision_amps, decision_on, decision_reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     sample.ts, sample.solar_w, sample.load_w, sample.battery_w,
                     sample.grid_w, sample.soc_pct, sample.theoretical_w,
-                    sample.forecast_w, sample.charger_amps,
+                    sample.charger_amps,
                     _bool(sample.charger_on),
                     _bool(sample.pw_ok), _bool(sample.em_ok), sample.mode,
                     sample.decision_amps, _bool(sample.decision_on),
@@ -129,7 +191,7 @@ class SampleStore:
             rows = conn.execute(
                 """
                 SELECT ts, solar_w, load_w, battery_w, grid_w, soc_pct,
-                       theoretical_w, forecast_w, charger_amps, charger_on,
+                       theoretical_w, charger_amps, charger_on,
                        pw_ok, em_ok, mode, decision_amps, decision_on,
                        decision_reason
                 FROM samples WHERE ts BETWEEN ? AND ? ORDER BY ts
@@ -143,11 +205,190 @@ class SampleStore:
         return [
             Sample(
                 ts=r[0], solar_w=r[1], load_w=r[2], battery_w=r[3], grid_w=r[4],
-                soc_pct=r[5], theoretical_w=r[6], forecast_w=r[7],
-                charger_amps=r[8], charger_on=_opt_bool(r[9]),
-                pw_ok=_opt_bool(r[10]), em_ok=_opt_bool(r[11]), mode=r[12],
-                decision_amps=r[13], decision_on=_opt_bool(r[14]),
-                decision_reason=r[15],
+                soc_pct=r[5], theoretical_w=r[6],
+                charger_amps=r[7], charger_on=_opt_bool(r[8]),
+                pw_ok=_opt_bool(r[9]), em_ok=_opt_bool(r[10]), mode=r[11],
+                decision_amps=r[12], decision_on=_opt_bool(r[13]),
+                decision_reason=r[14],
             )
             for r in rows
         ]
+
+
+def _cloud_to_label(pct: float) -> str:
+    """Coarse qualitative label from cloud opacity %."""
+    if pct < 12.5:
+        return "Clear"
+    if pct < 37.5:
+        return "Mostly clear"
+    if pct < 62.5:
+        return "Partly cloudy"
+    if pct < 87.5:
+        return "Mostly cloudy"
+    return "Overcast"
+
+
+_FORECAST_COLS = (
+    "period_ts", "fetched_at", "source",
+    "pv_w_p10", "pv_w_p50", "pv_w_p90",
+    "ghi_w_per_m2", "ghi_w_per_m2_p10", "ghi_w_per_m2_p90",
+    "dni_w_per_m2", "dni_w_per_m2_p10", "dni_w_per_m2_p90",
+    "dhi_w_per_m2",
+    "air_temp_c", "cloud_opacity_pct", "relative_humidity_pct",
+    "surface_pressure_hpa", "precipitable_water_kg_per_m2",
+    "wind_speed_m_per_s", "wind_direction_deg",
+    "weather",
+)
+
+
+class ForecastStore:
+    """SQLite store for versioned weather/PV forecasts.
+
+    Each Solcast (or other source) fetch inserts one row per 30-min period
+    keyed by (period_ts, fetched_at, source), so we keep the full history
+    of how predictions evolved. The chart reads the *latest* per period
+    via `latest_in_range`.
+    """
+
+    def __init__(self, db_path: Path) -> None:
+        self._db_path = db_path
+        _init_db(db_path)
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self._db_path, isolation_level=None, timeout=5.0)
+
+    def fetch_events(
+        self, start_ts: int, end_ts: int, source: str = "solcast",
+    ) -> list[tuple[int, float | None]]:
+        """Refresh events in [start_ts, end_ts]: (fetched_at, pv_w_p50_at_fetch).
+
+        The y-value is the median forecast for the 30-min period that
+        contains `fetched_at` — i.e. "what did Solcast predict for the
+        moment we made the call?". Useful for placing markers on the
+        chart's forecast line.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT f.fetched_at, f.pv_w_p50
+                FROM forecasts f
+                WHERE f.source = ?
+                  AND f.fetched_at BETWEEN ? AND ?
+                  AND f.period_ts = (
+                      SELECT period_ts FROM forecasts f2
+                      WHERE f2.source = f.source AND f2.fetched_at = f.fetched_at
+                      ORDER BY ABS(f2.period_ts - f2.fetched_at)
+                      LIMIT 1
+                  )
+                ORDER BY f.fetched_at
+                """,
+                (source, start_ts, end_ts),
+            ).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
+    def current_qualitative(self, source: str = "solcast") -> str | None:
+        """Qualitative weather label for the period containing "now".
+
+        Prefers Solcast's categorical `weather` field; falls back to a
+        cloud-opacity-derived label so we still get a useful answer when
+        the API tier doesn't surface `weather` directly.
+        """
+        import time as _t
+        now_ts = int(_t.time())
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT weather, cloud_opacity_pct FROM forecasts
+                WHERE source = ?
+                  AND ABS(period_ts - ?) <= 900
+                ORDER BY fetched_at DESC, ABS(period_ts - ?) ASC
+                LIMIT 1
+                """,
+                (source, now_ts, now_ts),
+            ).fetchone()
+        if not row:
+            return None
+        weather, cloud_pct = row
+        if weather:
+            return weather
+        if cloud_pct is None:
+            return None
+        return _cloud_to_label(float(cloud_pct))
+
+    def last_fetched_at(self, source: str = "solcast") -> int | None:
+        """Most recent fetched_at for `source`, or None if no rows."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT MAX(fetched_at) FROM forecasts WHERE source = ?",
+                (source,),
+            ).fetchone()
+        return row[0] if row and row[0] is not None else None
+
+    def insert_many(self, forecasts: list[Forecast]) -> None:
+        placeholders = ", ".join("?" * len(_FORECAST_COLS))
+        rows = [
+            tuple(getattr(f, col) for col in _FORECAST_COLS) for f in forecasts
+        ]
+        with self._connect() as conn:
+            conn.executemany(
+                f"INSERT OR REPLACE INTO forecasts ({', '.join(_FORECAST_COLS)}) "
+                f"VALUES ({placeholders})",
+                rows,
+            )
+
+    def operational_in_range(
+        self, start_ts: int, end_ts: int, source: str = "solcast",
+    ) -> list[Forecast]:
+        """For each period in [start, end], the forecast that was the most
+        recent one *as of that period's own timestamp*.
+
+        For future periods this is identical to `latest_in_range` (every
+        fetch we have is older than the period). For past periods it's the
+        forecast that was operational at that time — ignoring later
+        refinements that we have the benefit of hindsight on.
+
+        So if Solcast refreshed at 05:00, 07:42, 09:29 today, the
+        operational forecast for the 09:00 period comes from the 07:42
+        fetch (not 09:29, which arrived later).
+        """
+        select_cols = ", ".join(f"f1.{c}" for c in _FORECAST_COLS)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT {select_cols}
+                FROM forecasts f1
+                WHERE f1.source = ?
+                  AND f1.period_ts BETWEEN ? AND ?
+                  AND f1.fetched_at = (
+                      SELECT MAX(f2.fetched_at) FROM forecasts f2
+                      WHERE f2.source = f1.source
+                        AND f2.period_ts = f1.period_ts
+                        AND f2.fetched_at <= f1.period_ts
+                  )
+                ORDER BY f1.period_ts
+                """,
+                (source, start_ts, end_ts),
+            ).fetchall()
+        return [Forecast(**dict(zip(_FORECAST_COLS, r))) for r in rows]
+
+    def latest_in_range(
+        self, start_ts: int, end_ts: int, source: str = "solcast",
+    ) -> list[Forecast]:
+        """Return the most recent forecast per period in [start_ts, end_ts]."""
+        select_cols = ", ".join(f"f1.{c}" for c in _FORECAST_COLS)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT {select_cols}
+                FROM forecasts f1
+                WHERE f1.source = ?
+                  AND f1.period_ts BETWEEN ? AND ?
+                  AND f1.fetched_at = (
+                      SELECT MAX(f2.fetched_at) FROM forecasts f2
+                      WHERE f2.period_ts = f1.period_ts AND f2.source = f1.source
+                  )
+                ORDER BY f1.period_ts
+                """,
+                (source, start_ts, end_ts),
+            ).fetchall()
+        return [Forecast(**dict(zip(_FORECAST_COLS, r))) for r in rows]

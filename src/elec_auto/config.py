@@ -81,6 +81,20 @@ class Settings(BaseSettings):
     solar_panel_tilt_deg: float = Field(default=30.0, ge=0.0, le=90.0)
     solar_system_loss_factor: float = Field(default=0.09, ge=0.0, le=0.5)
 
+    # Solcast solar forecast — hobbyist tier is 10 calls/day per resource.
+    # We schedule 8 fetches (1 at 5 AM + 7 evenly between sunrise and sunset)
+    # and keep 2 calls in reserve for retries / debugging.
+    solcast_api_key: str | None = None
+    solcast_resource_id: str | None = None
+    # On service startup, skip the immediate fetch if the previous fetch is
+    # younger than this many minutes — protects the daily call budget
+    # against rapid restart cycles during development.
+    solcast_skip_recent_minutes: int = Field(default=60, ge=0, le=240)
+    # How far into the future to request forecasts. 72 h (3 days) covers
+    # the PW3's ~2-day battery autonomy plus one extra day for "will day
+    # 3 be a dud?" planning. Solcast hobbyist allows up to 168 h.
+    solcast_forecast_horizon_hours: int = Field(default=72, ge=24, le=168)
+
     # Time zone passed to pypowerwall for timestamp handling.
     timezone: str = "America/Los_Angeles"
 
