@@ -260,9 +260,9 @@ def _control_tick() -> None:
 
 # Channels we treat as roll-ups, not individual circuits. The per-circuit
 # chart skips these because they double-count (Main = sum of everything;
-# Garage Subpanel = sum of its branches; EV Charger has its own diagram
-# node) and they'd otherwise dominate the y-axis.
-_AGGREGATE_CIRCUITS = {"Main", "Garage Subpanel", "EV Charger", "Balance"}
+# Garage Subpanel = sum of its branches) and they'd otherwise dominate
+# the y-axis.
+_AGGREGATE_CIRCUITS = {"Main", "Garage Subpanel", "Balance"}
 
 # Color palette for circuit polylines. Assigned in sorted-name order so
 # the same circuit gets the same color across page reloads. Sourced from
@@ -345,8 +345,15 @@ def _circuits_section() -> str:
     start_ts = now_ts - 12 * 3600
     end_ts = now_ts + 12 * 3600
 
+    DAY_SEC = 24 * 3600
     rows = [
         r for r in _load_store().read_range(start_ts, now_ts)
+        if r.circuit not in _AGGREGATE_CIRCUITS
+    ]
+    # Dumb forecast: yesterday's data for the same wall-clock hours we'd be
+    # showing in the future half, shifted +24 h so it lands there.
+    forecast_rows = [
+        r for r in _load_store().read_range(now_ts - DAY_SEC, end_ts - DAY_SEC)
         if r.circuit not in _AGGREGATE_CIRCUITS
     ]
 
@@ -354,7 +361,7 @@ def _circuits_section() -> str:
     PAD_L, PAD_R, PAD_B = 50, 12, 30
     plot_w = W - PAD_L - PAD_R
 
-    if not rows:
+    if not rows and not forecast_rows:
         PAD_T = 26
         plot_h = H - PAD_T - PAD_B
         return (
@@ -368,19 +375,30 @@ def _circuits_section() -> str:
     by_circuit: dict[str, list[tuple[int, float]]] = {}
     for r in rows:
         by_circuit.setdefault(r.circuit, []).append((r.ts, r.watts))
+    by_circuit_fc: dict[str, list[tuple[int, float]]] = {}
+    for r in forecast_rows:
+        by_circuit_fc.setdefault(r.circuit, []).append((r.ts + DAY_SEC, r.watts))
 
-    max_w = max(max(w for _, w in pts) for pts in by_circuit.values())
+    all_circuits = set(by_circuit) | set(by_circuit_fc)
+    max_w = max(
+        max((w for pts in by_circuit.values() for _, w in pts), default=0.0),
+        max((w for pts in by_circuit_fc.values() for _, w in pts), default=0.0),
+    )
     step_w, y_max_w = _nice_y_axis(max_w, target_ticks=8)
 
     name_color = {
         name: _CIRCUIT_PALETTE[i % len(_CIRCUIT_PALETTE)]
-        for i, name in enumerate(sorted(by_circuit))
+        for i, name in enumerate(sorted(all_circuits))
     }
 
     # Pack legend into rows that fit the chart width. Sorted by total energy
-    # so the heaviest circuits appear first.
-    energy = {n: sum(w for _, w in by_circuit[n]) for n in by_circuit}
-    legend_order = sorted(by_circuit, key=lambda n: energy[n], reverse=True)
+    # (today + yesterday-forecast) so the heaviest circuits appear first.
+    energy = {
+        n: sum(w for _, w in by_circuit.get(n, []))
+        + sum(w for _, w in by_circuit_fc.get(n, []))
+        for n in all_circuits
+    }
+    legend_order = sorted(all_circuits, key=lambda n: energy[n], reverse=True)
     legend_rows = _pack_legend_rows(legend_order, available_px=plot_w - 8)
 
     LEGEND_LINE_PX = 14
@@ -454,30 +472,36 @@ def _circuits_section() -> str:
         f'stroke="currentColor" stroke-width="1" opacity="0.35"/>'
     )
 
-    # One polyline per circuit, broken at telemetry gaps (>90 s between samples).
-    for circuit in sorted(by_circuit):
-        pts = sorted(by_circuit[circuit])
-        color = name_color[circuit]
-        segments: list[list[tuple[float, float]]] = []
-        cur_seg: list[tuple[float, float]] = []
-        prev_ts = None
-        for ts, w in pts:
-            if prev_ts is not None and ts - prev_ts > 90:
-                if len(cur_seg) >= 2:
-                    segments.append(cur_seg)
-                cur_seg = []
-            cur_seg.append((x_for(ts), y_for(w)))
-            prev_ts = ts
-        if cur_seg:
-            segments.append(cur_seg)
-        for seg in segments:
-            if len(seg) < 2:
-                continue
-            pts_str = " ".join(f"{x:.1f},{y:.1f}" for x, y in seg)
-            parts.append(
-                f'<polyline points="{pts_str}" fill="none" stroke="{color}" '
-                f'stroke-width="1.5"/>'
-            )
+    # One polyline per circuit, broken at telemetry gaps (>90 s between
+    # samples). Today's data is drawn solid in the past half; yesterday's
+    # data is drawn dashed/faded in the future half as a "dumb forecast".
+    def draw(data: dict[str, list[tuple[int, float]]], extra_attrs: str) -> None:
+        for circuit in sorted(data):
+            pts = sorted(data[circuit])
+            color = name_color[circuit]
+            segments: list[list[tuple[float, float]]] = []
+            cur_seg: list[tuple[float, float]] = []
+            prev_ts = None
+            for ts, w in pts:
+                if prev_ts is not None and ts - prev_ts > 90:
+                    if len(cur_seg) >= 2:
+                        segments.append(cur_seg)
+                    cur_seg = []
+                cur_seg.append((x_for(ts), y_for(w)))
+                prev_ts = ts
+            if cur_seg:
+                segments.append(cur_seg)
+            for seg in segments:
+                if len(seg) < 2:
+                    continue
+                pts_str = " ".join(f"{x:.1f},{y:.1f}" for x, y in seg)
+                parts.append(
+                    f'<polyline points="{pts_str}" fill="none" stroke="{color}" '
+                    f'stroke-width="1.5"{extra_attrs}/>'
+                )
+
+    draw(by_circuit, "")
+    draw(by_circuit_fc, ' stroke-dasharray="4 3" opacity="0.45"')
 
     return (
         f'<svg viewBox="0 0 {W} {H}" class="chart" '
@@ -597,11 +621,12 @@ def _chart_svg() -> str:
         f'stroke="currentColor" stroke-width="1" opacity="0.35"/>'
     )
 
-    def series_polyline(getter, stroke: str) -> str:
+    def series_polyline(getter, stroke: str, smooth: int = 1) -> str:
         # Break the polyline at gaps (NULL readings) so we don't connect
-        # across telemetry outages.
-        segments: list[list[tuple[float, float]]] = []
-        current: list[tuple[float, float]] = []
+        # across telemetry outages. With smooth>1, apply a centered moving
+        # average within each segment before mapping to chart coords.
+        segments: list[list[tuple[int, float]]] = []
+        current: list[tuple[int, float]] = []
         for s in samples:
             v = getter(s)
             if v is None or v < 0:
@@ -609,11 +634,29 @@ def _chart_svg() -> str:
                     segments.append(current)
                     current = []
             else:
-                current.append((x_for(s.ts), y_for(v)))
+                current.append((s.ts, v))
         if current:
             segments.append(current)
+
+        if smooth > 1:
+            half = smooth // 2
+            smoothed: list[list[tuple[int, float]]] = []
+            for seg in segments:
+                sm: list[tuple[int, float]] = []
+                for i in range(len(seg)):
+                    # Only smooth where a full centered window fits.
+                    # Endpoints stay raw so the most recent sample isn't
+                    # dragged toward stale values by an asymmetric window.
+                    if i < half or i > len(seg) - 1 - half:
+                        sm.append(seg[i])
+                    else:
+                        window = seg[i - half : i + half + 1]
+                        sm.append((seg[i][0], sum(v for _, v in window) / len(window)))
+                smoothed.append(sm)
+            segments = smoothed
+
         return "".join(
-            f'<polyline points="{" ".join(f"{x:.1f},{y:.1f}" for x, y in seg)}" '
+            f'<polyline points="{" ".join(f"{x_for(ts):.1f},{y_for(v):.1f}" for ts, v in seg)}" '
             f'fill="none" stroke="{stroke}" stroke-width="1.5"/>'
             for seg in segments if len(seg) >= 2
         )
@@ -643,9 +686,10 @@ def _chart_svg() -> str:
         )
 
     # Home load: grey to match the home node in the diagram above.
-    parts.append(series_polyline(lambda s: s.load_w, "#888888"))
+    parts.append(series_polyline(lambda s: s.load_w, "#888888", smooth=3))
     # Actual solar: orange to match the solar node in the diagram above.
-    parts.append(series_polyline(lambda s: s.solar_w, "#e8a33d"))
+    # 3-point centered moving average smooths the 30 s sample jitter.
+    parts.append(series_polyline(lambda s: s.solar_w, "#e8a33d", smooth=3))
     # Solcast forecast: dashed teal so it reads as "predicted" rather than
     # measured. Spans the full window (past forecasts that we kept + future
     # predictions for the right half).
