@@ -22,6 +22,8 @@ from .config import settings
 from .controller import compute_target
 from .emporia import ChargerState, Emporia
 from .flow import Flows, decompose
+from .forecast import load_forecast as _load_forecast
+from .forecast import soc_forecast as _soc_forecast
 from .policy import Decision
 from .powerwall import Powerwall, PowerReading
 from .samples import Forecast, ForecastStore, LoadStore, Sample, SampleStore
@@ -739,6 +741,34 @@ def _chart_svg() -> str:
             f'<polyline points="{pts}" fill="none" '
             f'stroke="#2ea56a" stroke-width="1.5"/>'
         )
+
+    # Heuristic forecasts for the future half: dashed load (grey) and SoC
+    # (green) extensions matching the colors of the solid past-half traces.
+    load_fc = _load_forecast(_sample_store(), now_ts, end_ts)
+    last_soc = next(
+        (s.soc_pct for s in reversed(samples) if s.soc_pct is not None), None,
+    )
+    soc_fc = _soc_forecast(
+        now_ts=now_ts, end_ts=end_ts, current_soc_pct=last_soc,
+        pv_forecasts=forecasts, load_forecasts=load_fc,
+        settings=settings,
+    )
+
+    def _dashed(pts: list[tuple[float, float]], stroke: str) -> str:
+        if len(pts) < 2:
+            return ""
+        s = " ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
+        return (
+            f'<polyline points="{s}" fill="none" stroke="{stroke}" '
+            f'stroke-width="1.5" stroke-dasharray="4 3" opacity="0.65"/>'
+        )
+
+    parts.append(_dashed(
+        [(x_for(lf.ts), y_for(lf.load_w)) for lf in load_fc], "#888888",
+    ))
+    parts.append(_dashed(
+        [(x_for(sf.ts), y_for_pct(sf.soc_pct)) for sf in soc_fc], "#2ea56a",
+    ))
 
     parts.append(
         f'<text x="{PAD_L+8}" y="{PAD_T+14}" font-size="11">'

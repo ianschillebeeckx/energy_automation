@@ -46,6 +46,10 @@ class Settings(BaseSettings):
     # Powerwall usable capacity (kWh). One PW3 unit is 13.5 kWh; override
     # in .env if the site has more. Used by the morning-dump calculator.
     battery_capacity_kwh: float = 13.5
+    # Inverter max AC charge rate. One PW3 unit is ~5 kW; override if the
+    # site has multiple units. Used by forecast.soc_forecast() to spill
+    # PV surplus exceeding this rate to the grid in the integration model.
+    battery_max_charge_kw: float = Field(default=5.0, ge=0.5, le=20.0)
     # Percent of raw battery capacity Tesla hides as the bottom-of-pack
     # reserve. The local /api/system_status/soe endpoint returns raw SoC;
     # we scale it to the Tesla-app "displayed" SoC via
