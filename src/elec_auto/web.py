@@ -24,9 +24,13 @@ from .emporia import ChargerState, Emporia
 from .flow import Flows, decompose
 from .forecast import load_forecast as _load_forecast
 from .forecast import soc_forecast as _soc_forecast
+from .nws import NWS
 from .policy import Decision
 from .powerwall import Powerwall, PowerReading
-from .samples import Forecast, ForecastStore, LoadStore, Sample, SampleStore
+from .samples import (
+    Forecast, ForecastStore, LoadStore, ObservationStore, Sample, SampleStore,
+    WeatherStore,
+)
 from .solar import theoretical_w
 from .solcast import Solcast, daily_schedule
 
@@ -40,6 +44,9 @@ async def _lifespan(app_: FastAPI):
     if settings.solcast_api_key and settings.solcast_resource_id:
         tasks.append(loop.create_task(_forecast_loop()))
         logger.info("solcast forecast loop started")
+    if settings.latitude is not None and settings.longitude is not None:
+        tasks.append(loop.create_task(_weather_loop()))
+        logger.info("nws weather loop started")
     try:
         yield
     finally:
@@ -59,6 +66,8 @@ _em: Emporia | None = None
 _samples: SampleStore | None = None
 _forecasts: ForecastStore | None = None
 _loads: LoadStore | None = None
+_weather: WeatherStore | None = None
+_observations: ObservationStore | None = None
 
 
 def _db_path():
@@ -85,6 +94,20 @@ def _load_store() -> LoadStore:
     if _loads is None:
         _loads = LoadStore(_db_path())
     return _loads
+
+
+def _weather_store() -> WeatherStore:
+    global _weather
+    if _weather is None:
+        _weather = WeatherStore(_db_path())
+    return _weather
+
+
+def _observation_store() -> ObservationStore:
+    global _observations
+    if _observations is None:
+        _observations = ObservationStore(_db_path())
+    return _observations
 
 _CHARGE_MODES: dict[str, str] = {
     "surplus":      "Surplus solar",
@@ -218,7 +241,16 @@ def _control_tick() -> None:
         return  # hands off: leave the EVSE entirely under manual control
     pw, _ = _safe_pw()
     ev, _ = _safe_em()
-    decision = compute_target(_charge_mode, pw, ev, settings)
+    # Operational PV forecasts: only the morning_dump mode uses these, but
+    # the call is cheap and including them unconditionally keeps the
+    # controller signature uniform across modes.
+    now_ts = int(time.time())
+    pv_forecasts = _forecast_store().operational_in_range(
+        now_ts, now_ts + 24 * 3600,
+    )
+    decision = compute_target(
+        _charge_mode, pw, ev, settings, pv_forecasts=pv_forecasts,
+    )
 
     # Auto-switch morning_dump -> surplus when the dump is done, so the
     # car keeps catching daytime surplus once the battery is drained.
@@ -234,7 +266,9 @@ def _control_tick() -> None:
             logger.info("morning_dump complete ({}) -> surplus", decision.reason)
             _charge_mode = "surplus"
             _dump_was_active = False
-            decision = compute_target(_charge_mode, pw, ev, settings)
+            decision = compute_target(
+                _charge_mode, pw, ev, settings, pv_forecasts=pv_forecasts,
+            )
 
     # Auto-switch surplus -> morning_dump once we cross today's astronomical
     # sunset, queueing the next morning's scheduled charge.
@@ -242,7 +276,9 @@ def _control_tick() -> None:
         logger.info("past sunset -> morning_dump")
         _charge_mode = "morning_dump"
         _dump_was_active = False
-        decision = compute_target(_charge_mode, pw, ev, settings)
+        decision = compute_target(
+            _charge_mode, pw, ev, settings, pv_forecasts=pv_forecasts,
+        )
 
     _record_sample(pw, ev, _charge_mode, decision)
     _record_loads(int(time.time()))
@@ -916,6 +952,63 @@ async def _forecast_loop() -> None:
         )
         await asyncio.sleep(sleep_sec)
         await loop.run_in_executor(None, _fetch_forecast)
+
+
+def _fetch_weather() -> None:
+    client = NWS(settings)
+    try:
+        rows = client.fetch(horizon_hours=settings.nws_forecast_horizon_hours)
+        _weather_store().insert_many(rows)
+        logger.info("nws forecast: stored {} hourly rows ({}h horizon)",
+                    len(rows), settings.nws_forecast_horizon_hours)
+    except Exception:
+        logger.exception("nws forecast fetch failed")
+    try:
+        obs = client.fetch_observations(
+            hours=settings.nws_obs_hours,
+            station_id=settings.nws_obs_station_id,
+        )
+        _observation_store().insert_many(obs)
+        logger.info("nws obs ({}): stored {} hourly rows",
+                    settings.nws_obs_station_id, len(obs))
+    except Exception:
+        logger.exception("nws observations fetch failed")
+
+
+async def _weather_loop() -> None:
+    """Refresh the NWS hourly forecast once a day at 05:00 local.
+
+    Mirrors the Solcast 05:00 slot so the morning_dump window (06:00)
+    always sees a fresh weather forecast. On startup, fetch immediately
+    if we haven't fetched yet today.
+    """
+    from datetime import timedelta as _td
+    from zoneinfo import ZoneInfo
+
+    loop = asyncio.get_running_loop()
+    tz = ZoneInfo(settings.timezone)
+
+    last = _weather_store().last_fetched_at()
+    today_5am_ts = int(datetime.now(tz).replace(
+        hour=5, minute=0, second=0, microsecond=0,
+    ).timestamp())
+    if last is None or last < today_5am_ts:
+        await loop.run_in_executor(None, _fetch_weather)
+    else:
+        logger.info("nws: skipping startup fetch (already fetched today)")
+
+    while True:
+        now = datetime.now(tz)
+        next_t = now.replace(hour=5, minute=0, second=0, microsecond=0)
+        if next_t <= now:
+            next_t += _td(days=1)
+        sleep_sec = (next_t - now).total_seconds()
+        logger.info(
+            "nws: next fetch at {} (in {:.0f} min)",
+            next_t.strftime("%a %H:%M"), sleep_sec / 60.0,
+        )
+        await asyncio.sleep(sleep_sec)
+        await loop.run_in_executor(None, _fetch_weather)
 
 
 async def _control_loop() -> None:

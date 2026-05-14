@@ -6,7 +6,7 @@ from pathlib import Path
 
 from elec_auto.config import Settings
 from elec_auto.forecast import (
-    LoadForecast, SocForecast, load_forecast, soc_forecast,
+    LoadForecast, SocForecast, load_forecast, pv_kwh_in_range, soc_forecast,
 )
 from elec_auto.samples import Forecast, Sample, SampleStore
 
@@ -55,7 +55,7 @@ def test_load_forecast_skips_negative_load(tmp_path: Path) -> None:
     assert [f.load_w for f in out] == [500.0]
 
 
-# --- soc_forecast ------------------------------------------------------------
+# --- shared helpers for pv_kwh_in_range / soc_forecast -----------------------
 
 
 def _const_pv(now_ts: int, end_ts: int, watts: float) -> list[Forecast]:
@@ -77,6 +77,34 @@ def _const_load(now_ts: int, end_ts: int, watts: float) -> list[LoadForecast]:
         out.append(LoadForecast(ts=t, load_w=watts))
         t += 30
     return out
+
+
+# --- pv_kwh_in_range ---------------------------------------------------------
+
+
+def test_pv_kwh_in_range_constant_two_kw_for_one_hour() -> None:
+    # 2 kW flat over 1 h → exactly 2 kWh.
+    forecasts = _const_pv(0, 3600, 2000)
+    assert abs(pv_kwh_in_range(forecasts, 0, 3600) - 2.0) < 1e-6
+
+
+def test_pv_kwh_in_range_zero_when_window_empty() -> None:
+    forecasts = _const_pv(0, 3600, 2000)
+    assert pv_kwh_in_range(forecasts, 1000, 1000) == 0.0
+    assert pv_kwh_in_range(forecasts, 1000, 500) == 0.0  # inverted
+
+
+def test_pv_kwh_in_range_zero_without_forecast_data() -> None:
+    assert pv_kwh_in_range([], 0, 3600) == 0.0
+
+
+def test_pv_kwh_in_range_skips_periods_outside_data_span() -> None:
+    # Forecast only covers 1000..2000; querying 3000..4000 → 0.
+    forecasts = _const_pv(1000, 2000, 5000)
+    assert pv_kwh_in_range(forecasts, 3000, 4000) == 0.0
+
+
+# --- soc_forecast ------------------------------------------------------------
 
 
 def test_soc_forecast_empty_when_no_current_soc() -> None:

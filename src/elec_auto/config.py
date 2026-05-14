@@ -64,6 +64,20 @@ class Settings(BaseSettings):
     morning_dump_hours: float = 2.0
     morning_dump_start_hour: int = Field(default=6, ge=0, le=23)
     morning_dump_start_minute: int = Field(default=0, ge=0, le=59)
+    # Conservative discount applied to the Solcast PV forecast when sizing
+    # the morning-dump rate. At 90%, only 10% of the forecast PV between
+    # now and the window end is treated as "guaranteed" extra headroom on
+    # top of the battery SoC headroom. Bump down toward 0% as confidence
+    # in the local forecast grows.
+    morning_dump_pv_discount_pct: float = Field(default=90.0, ge=0.0, le=100.0)
+    # Sunny-day deep dump. When today's forecast PV reaches this fraction
+    # of the clear-sky theoretical, allow the dump to drain further than
+    # the normal floor — making more battery room for the day's
+    # generation. Disabled when no forecast data is available.
+    morning_dump_sunny_threshold_pct: float = Field(
+        default=80.0, ge=0.0, le=100.0,
+    )
+    morning_dump_sunny_floor_pct: int = Field(default=5, ge=1, le=99)
     # Trickle mode fixed rate.
     trickle_kw: float = 2.0
 
@@ -98,6 +112,23 @@ class Settings(BaseSettings):
     # the PW3's ~2-day battery autonomy plus one extra day for "will day
     # 3 be a dud?" planning. Solcast hobbyist allows up to 168 h.
     solcast_forecast_horizon_hours: int = Field(default=72, ge=24, le=168)
+
+    # NWS (US National Weather Service). Free, no API key, but they
+    # require a descriptive User-Agent for politeness. Override in .env if
+    # you'd like to identify yourself to NWS support.
+    nws_user_agent: str = (
+        "elec_auto (https://github.com/ianschillebeeckx/elec_auto)"
+    )
+    # How many hours of hourly weather to keep per fetch. NWS returns ~156
+    # (6.5 days) but the further-out periods aren't actionable for next-day
+    # planning, so we truncate to keep the table compact.
+    nws_forecast_horizon_hours: int = Field(default=72, ge=24, le=156)
+    # Past-observations companion to the forecast. We pull station readings
+    # for the last `nws_obs_hours` and downsample to one row per top-of-
+    # hour, stored as source='nws_obs'. NWS only retains ~7 days of
+    # observations publicly; longer history accrues in our local DB.
+    nws_obs_station_id: str = "KSFO"   # SFO airport ASOS, ~8 mi from site
+    nws_obs_hours: int = Field(default=24, ge=1, le=168)
 
     # Per-circuit load logging: a row goes into the `loads` table only when
     # the channel's draw exceeds this threshold. Filters out noise on

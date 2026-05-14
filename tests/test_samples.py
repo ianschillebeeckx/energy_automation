@@ -5,7 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from elec_auto.samples import (
-    CircuitReading, Forecast, ForecastStore, LoadStore, Sample, SampleStore,
+    CircuitReading, Forecast, ForecastStore, LoadStore, Observation,
+    ObservationStore, Sample, SampleStore, Weather, WeatherStore,
 )
 
 
@@ -208,3 +209,119 @@ def test_load_insert_or_replace_same_pk(tmp_path: Path) -> None:
     ls.insert_tick(1000, {"Oven": 200.0})  # same (ts, circuit)
     [row] = ls.read_range(0, 2000)
     assert row.watts == 200.0
+
+
+# --- WeatherStore -----------------------------------------------------------
+
+def test_weather_round_trip(tmp_path: Path) -> None:
+    ws = WeatherStore(tmp_path / "samples.db")
+    ws.insert_many([Weather(
+        period_ts=1000, fetched_at=900, source="nws",
+        temperature_c=12.5, dewpoint_c=8.0, rel_humidity_pct=84.0,
+        prob_precip_pct=0.0, wind_speed_mph=3.0, wind_dir="WSW",
+        short_forecast="Sunny", sky_cover_pct=12.0,
+    )])
+    [row] = ws.latest_in_range(0, 2000)
+    assert row.temperature_c == 12.5
+    assert row.short_forecast == "Sunny"
+    assert row.sky_cover_pct == 12.0
+
+
+def test_weather_latest_in_range_picks_most_recent_fetch(tmp_path: Path) -> None:
+    ws = WeatherStore(tmp_path / "samples.db")
+    ws.insert_many([
+        Weather(period_ts=1000, fetched_at=800, source="nws", temperature_c=10.0),
+        Weather(period_ts=1000, fetched_at=900, source="nws", temperature_c=11.0),
+        Weather(period_ts=2000, fetched_at=900, source="nws", temperature_c=12.0),
+    ])
+    rows = ws.latest_in_range(0, 3000)
+    by_period = {r.period_ts: r.temperature_c for r in rows}
+    assert by_period == {1000: 11.0, 2000: 12.0}
+
+
+def test_weather_last_fetched_at(tmp_path: Path) -> None:
+    ws = WeatherStore(tmp_path / "samples.db")
+    assert ws.last_fetched_at() is None
+    ws.insert_many([
+        Weather(period_ts=1000, fetched_at=800, source="nws"),
+        Weather(period_ts=2000, fetched_at=1500, source="nws"),
+    ])
+    assert ws.last_fetched_at() == 1500
+
+
+def test_weather_source_filter(tmp_path: Path) -> None:
+    ws = WeatherStore(tmp_path / "samples.db")
+    ws.insert_many([
+        Weather(period_ts=1000, fetched_at=900, source="nws", temperature_c=10.0),
+        Weather(period_ts=1000, fetched_at=900, source="other", temperature_c=20.0),
+    ])
+    [row] = ws.latest_in_range(0, 2000, source="nws")
+    assert row.temperature_c == 10.0
+    [row] = ws.latest_in_range(0, 2000, source="other")
+    assert row.temperature_c == 20.0
+
+
+def test_weather_insert_many_empty_is_noop(tmp_path: Path) -> None:
+    ws = WeatherStore(tmp_path / "samples.db")
+    ws.insert_many([])
+    assert ws.latest_in_range(0, 9999) == []
+
+
+# --- ObservationStore ------------------------------------------------------
+
+def test_observation_round_trip(tmp_path: Path) -> None:
+    os_ = ObservationStore(tmp_path / "samples.db")
+    os_.insert_many([Observation(
+        period_ts=1000, station_id="KSFO", fetched_at=900,
+        temperature_c=14.0, dewpoint_c=10.0, rel_humidity_pct=77.0,
+        wind_speed_mph=5.0, wind_dir="W", text_description="Clear",
+        sky_cover_pct=15.0,
+    )])
+    [row] = os_.read_range(0, 2000)
+    assert row.temperature_c == 14.0
+    assert row.text_description == "Clear"
+    assert row.station_id == "KSFO"
+
+
+def test_observation_insert_or_replace_same_period(tmp_path: Path) -> None:
+    # Re-fetching the same (period_ts, station_id) overwrites.
+    os_ = ObservationStore(tmp_path / "samples.db")
+    os_.insert_many([Observation(period_ts=1000, station_id="KSFO",
+                                 temperature_c=10.0)])
+    os_.insert_many([Observation(period_ts=1000, station_id="KSFO",
+                                 temperature_c=11.0)])
+    [row] = os_.read_range(0, 2000)
+    assert row.temperature_c == 11.0
+
+
+def test_observation_station_filter(tmp_path: Path) -> None:
+    os_ = ObservationStore(tmp_path / "samples.db")
+    os_.insert_many([
+        Observation(period_ts=1000, station_id="KSFO", temperature_c=14.0),
+        Observation(period_ts=1000, station_id="KOAK", temperature_c=15.0),
+    ])
+    [row] = os_.read_range(0, 2000, station_id="KSFO")
+    assert row.temperature_c == 14.0
+    [row] = os_.read_range(0, 2000, station_id="KOAK")
+    assert row.temperature_c == 15.0
+
+
+def test_observation_range_filter(tmp_path: Path) -> None:
+    os_ = ObservationStore(tmp_path / "samples.db")
+    for t in [10, 20, 30, 40]:
+        os_.insert_many([Observation(period_ts=t, station_id="KSFO",
+                                     temperature_c=float(t))])
+    rows = os_.read_range(15, 35)
+    assert [r.period_ts for r in rows] == [20, 30]
+
+
+def test_observation_last_fetched_at(tmp_path: Path) -> None:
+    os_ = ObservationStore(tmp_path / "samples.db")
+    assert os_.last_fetched_at("KSFO") is None
+    os_.insert_many([
+        Observation(period_ts=1000, station_id="KSFO", fetched_at=800),
+        Observation(period_ts=2000, station_id="KSFO", fetched_at=1500),
+        Observation(period_ts=1000, station_id="KOAK", fetched_at=9999),
+    ])
+    assert os_.last_fetched_at("KSFO") == 1500
+    assert os_.last_fetched_at("KOAK") == 9999

@@ -14,7 +14,7 @@ sanity-check overlay, not a forecast.
 from __future__ import annotations
 
 import math
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from .config import Settings
 
@@ -58,3 +58,25 @@ def theoretical_w(when: datetime, settings: Settings) -> float:
         * cos_theta
         * (1.0 - settings.solar_system_loss_factor)
     )
+
+
+def theoretical_day_kwh(
+    day_start: datetime, settings: Settings, step_sec: int = 300,
+) -> float:
+    """Integrate the clear-sky model over the 24 h starting at `day_start`.
+
+    `day_start` must be timezone-aware. Used to gauge how close a real
+    or forecast day comes to the geometric maximum — e.g., to decide
+    whether to deepen the morning dump when a clear day is expected.
+    """
+    if day_start.tzinfo is None:
+        raise ValueError("day_start must be timezone-aware")
+    day_end = day_start + timedelta(days=1)
+    total = 0.0
+    t = day_start
+    while t < day_end:
+        w0 = theoretical_w(t, settings)
+        w1 = theoretical_w(t + timedelta(seconds=step_sec), settings)
+        total += (w0 + w1) / 2.0 * step_sec / 3600.0 / 1000.0
+        t += timedelta(seconds=step_sec)
+    return total

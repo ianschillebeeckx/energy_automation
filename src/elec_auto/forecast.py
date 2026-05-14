@@ -76,6 +76,34 @@ def _interp(points: list[tuple[int, float]], ts: int, default: float = 0.0) -> f
     return v0 + (v1 - v0) * frac
 
 
+def pv_kwh_in_range(
+    pv_forecasts: list[Forecast], start_ts: int, end_ts: int,
+) -> float:
+    """Integrate p50 PV forecast watts over [start_ts, end_ts] → kWh.
+
+    Trapezoidal sum at 5-minute steps using the same linear-interp helper
+    as soc_forecast. Returns 0 when end<=start or no forecast data
+    overlaps the window.
+    """
+    if end_ts <= start_ts or not pv_forecasts:
+        return 0.0
+    pts = sorted(
+        (f.period_ts, f.pv_w_p50)
+        for f in pv_forecasts if f.pv_w_p50 is not None
+    )
+    if not pts:
+        return 0.0
+    step = 300
+    total_kwh = 0.0
+    t = start_ts
+    while t < end_ts:
+        t_next = min(t + step, end_ts)
+        avg_w = (_interp(pts, t) + _interp(pts, t_next)) / 2.0
+        total_kwh += avg_w * (t_next - t) / 3600.0 / 1000.0
+        t = t_next
+    return total_kwh
+
+
 def soc_forecast(
     *,
     now_ts: int,

@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from elec_auto.config import Settings
-from elec_auto.solar import theoretical_w
+from elec_auto.solar import theoretical_day_kwh, theoretical_w
 
 _TZ = ZoneInfo("America/Los_Angeles")
 # Roughly San Francisco — coordinates are far enough from poles that sunrise
@@ -89,3 +89,29 @@ def test_higher_loss_factor_gives_lower_output() -> None:
 def test_returns_non_negative(hour: int) -> None:
     when = datetime(2026, 6, 21, hour, 0, tzinfo=_TZ)
     assert theoretical_w(when, _settings()) >= 0.0
+
+
+# --- theoretical_day_kwh -----------------------------------------------------
+
+
+def test_theoretical_day_kwh_winter_less_than_summer() -> None:
+    summer = theoretical_day_kwh(
+        datetime(2026, 6, 21, 0, 0, tzinfo=_TZ), _settings(),
+    )
+    winter = theoretical_day_kwh(
+        datetime(2026, 12, 21, 0, 0, tzinfo=_TZ), _settings(),
+    )
+    assert winter < summer
+    # SF + SSE 30° tilt: winter ≈ 75% of summer (panel tilt compensates).
+    assert 0.5 < winter / summer < 0.9
+
+
+def test_theoretical_day_kwh_rejects_naive_datetime() -> None:
+    with pytest.raises(ValueError):
+        theoretical_day_kwh(datetime(2026, 6, 21, 0, 0), _settings())
+
+
+def test_theoretical_day_kwh_zero_without_coordinates() -> None:
+    s = _settings(latitude=None, longitude=None)
+    out = theoretical_day_kwh(datetime(2026, 6, 21, 0, 0, tzinfo=_TZ), s)
+    assert out == 0.0

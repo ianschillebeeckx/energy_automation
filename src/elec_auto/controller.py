@@ -13,8 +13,46 @@ from zoneinfo import ZoneInfo
 
 from .config import Settings
 from .emporia import ChargerState
+from .forecast import pv_kwh_in_range
 from .policy import Decision, decide_ev_amps
 from .powerwall import PowerReading
+from .samples import Forecast
+from .solar import theoretical_day_kwh
+
+
+def _sunny_floor_pct(
+    pv_forecasts: list[Forecast] | None,
+    dump_start: datetime,
+    settings: Settings,
+) -> int:
+    """Lower the morning_dump floor when today's forecast looks clear.
+
+    Returns `morning_dump_sunny_floor_pct` if forecast PV for the day of
+    `dump_start` reaches `morning_dump_sunny_threshold_pct` of the
+    theoretical clear-sky integral, otherwise the normal floor.
+
+    TODO: replace this PV-only ratio with a simulation-based test using
+    forecast.soc_forecast(): start from the post-dump floor, integrate
+    (PV − load) forecast across the day, and lower the floor only when
+    SoC is projected to reach 100% by sunset (with a configurable
+    headroom buffer). That handles cloudy days with low load, sunny
+    days with heavy load (HVAC, EV trickle), and seasonal variations
+    in one principled rule instead of a static %-of-clear-sky threshold.
+    """
+    if not pv_forecasts:
+        return settings.morning_dump_floor_pct
+    day_start = dump_start.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end = day_start + timedelta(days=1)
+    forecast_kwh = pv_kwh_in_range(
+        pv_forecasts, int(day_start.timestamp()), int(day_end.timestamp()),
+    )
+    theoretical_kwh = theoretical_day_kwh(day_start, settings)
+    if theoretical_kwh <= 0:
+        return settings.morning_dump_floor_pct
+    ratio = forecast_kwh / theoretical_kwh
+    if ratio >= settings.morning_dump_sunny_threshold_pct / 100.0:
+        return settings.morning_dump_sunny_floor_pct
+    return settings.morning_dump_floor_pct
 
 
 def _next_dump_window(now: datetime, settings: Settings) -> tuple[datetime, datetime]:
@@ -43,6 +81,7 @@ def compute_target(
     ev: ChargerState | None,
     settings: Settings,
     now: datetime | None = None,
+    pv_forecasts: list[Forecast] | None = None,
 ) -> Decision:
     if mode == "off":
         # Charger off; keep whatever amperage was last configured so the
@@ -78,36 +117,79 @@ def compute_target(
         now_local = (now.astimezone(tz) if now is not None else datetime.now(tz))
         start, end = _next_dump_window(now_local, settings)
 
+        # Forecast PV between now and the window end adds to the headroom
+        # we have to drain; discount heavily for conservatism.
+        discount = 1.0 - settings.morning_dump_pv_discount_pct / 100.0
+        raw_pv_kwh = pv_kwh_in_range(
+            pv_forecasts or [],
+            int(max(now_local, start).timestamp()),
+            int(end.timestamp()),
+        )
+        forecast_kwh = raw_pv_kwh * discount
+
+        # Sunny-day deep dump: when today's full-day forecast clears the
+        # threshold of the theoretical max, drain to a lower floor so the
+        # battery has more room for incoming generation.
+        floor_pct = _sunny_floor_pct(pv_forecasts, start, settings)
+        sunny = floor_pct != settings.morning_dump_floor_pct
+
         if now_local < start:
             # Scheduled — preview the rate at full-window duration so the
             # dashboard shows what the charger is configured for.
-            amps, _ = _dump_amps_for(pw, settings.morning_dump_hours, settings)
-            return Decision(amps, f"scheduled {start:%a %H:%M}", on=False)
+            amps, _ = _dump_amps_for(
+                pw, settings.morning_dump_hours, settings, forecast_kwh,
+                floor_pct=floor_pct,
+            )
+            reason = f"scheduled {start:%a %H:%M}"
+            if sunny:
+                reason = f"sunny: {reason}"
+            return Decision(amps, reason, on=False)
 
         # In the window: base the rate on the time we have left so we
         # converge on the floor even if discharge was faster/slower than
         # estimated at the start.
         remaining_hr = max((end - now_local).total_seconds() / 3600.0, 0.05)
-        amps, reason = _dump_amps_for(pw, remaining_hr, settings)
+        amps, reason = _dump_amps_for(
+            pw, remaining_hr, settings, forecast_kwh, floor_pct=floor_pct,
+        )
+        if sunny:
+            reason = f"sunny: {reason}"
         return Decision(amps, reason, on=(amps > 0))
 
     return Decision(0, f"unknown mode {mode!r}", on=False)
 
 
 def _dump_amps_for(
-    pw: PowerReading, window_hours: float, settings: Settings,
+    pw: PowerReading,
+    window_hours: float,
+    settings: Settings,
+    forecast_kwh: float = 0.0,
+    floor_pct: int | None = None,
 ) -> tuple[int, str]:
-    """Return (amps, reason) for draining the battery to the floor in `window_hours`."""
-    headroom = (
-        (pw.battery_soc_pct - settings.morning_dump_floor_pct) / 100.0
+    """Return (amps, reason) for draining the battery to `floor_pct` in `window_hours`.
+
+    `forecast_kwh` is the (already-discounted) PV energy expected to arrive
+    during the window — added to the SoC-derived headroom so the EV can
+    absorb both the existing charge and the incoming generation.
+    `floor_pct` defaults to `settings.morning_dump_floor_pct`; the caller
+    overrides it for the sunny-day deeper dump.
+    """
+    floor = floor_pct if floor_pct is not None else settings.morning_dump_floor_pct
+    battery_kwh = (
+        (pw.battery_soc_pct - floor) / 100.0
         * settings.battery_capacity_kwh
     )
-    if headroom <= 0:
-        return 0, (
-            f"SoC {pw.battery_soc_pct:.0f}% at/below floor "
-            f"{settings.morning_dump_floor_pct}%"
-        )
+    if battery_kwh <= 0:
+        return 0, f"SoC {pw.battery_soc_pct:.0f}% at/below floor {floor}%"
+    headroom = battery_kwh + forecast_kwh
     kw = headroom / window_hours
     amps = int(kw * 1000 / settings.ev_voltage)
     amps = max(settings.ev_min_amps, min(settings.ev_max_amps, amps))
-    return amps, f"dump {headroom:.1f} kWh in {window_hours:.2f} h -> {amps} A"
+    if forecast_kwh > 0:
+        reason = (
+            f"dump {battery_kwh:.1f}+{forecast_kwh:.1f} kWh in "
+            f"{window_hours:.2f} h -> {amps} A"
+        )
+    else:
+        reason = f"dump {battery_kwh:.1f} kWh in {window_hours:.2f} h -> {amps} A"
+    return amps, reason

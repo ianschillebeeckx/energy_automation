@@ -58,6 +58,35 @@ CREATE TABLE IF NOT EXISTS forecasts (
     PRIMARY KEY (period_ts, fetched_at, source)
 );
 CREATE INDEX IF NOT EXISTS idx_forecasts_period ON forecasts(period_ts);
+CREATE TABLE IF NOT EXISTS weather (
+    period_ts        INTEGER NOT NULL,
+    fetched_at       INTEGER NOT NULL,
+    source           TEXT    NOT NULL,
+    temperature_c    REAL,
+    dewpoint_c       REAL,
+    rel_humidity_pct REAL,
+    prob_precip_pct  REAL,
+    wind_speed_mph   REAL,
+    wind_dir         TEXT,
+    short_forecast   TEXT,
+    sky_cover_pct    REAL,
+    PRIMARY KEY (period_ts, fetched_at, source)
+);
+CREATE INDEX IF NOT EXISTS idx_weather_period ON weather(period_ts);
+CREATE TABLE IF NOT EXISTS observations (
+    period_ts        INTEGER NOT NULL,
+    station_id       TEXT    NOT NULL,
+    fetched_at       INTEGER,
+    temperature_c    REAL,
+    dewpoint_c       REAL,
+    rel_humidity_pct REAL,
+    wind_speed_mph   REAL,
+    wind_dir         TEXT,
+    text_description TEXT,
+    sky_cover_pct    REAL,
+    PRIMARY KEY (period_ts, station_id)
+);
+CREATE INDEX IF NOT EXISTS idx_observations_period ON observations(period_ts);
 CREATE TABLE IF NOT EXISTS loads (
     ts      INTEGER NOT NULL,
     circuit TEXT    NOT NULL,
@@ -400,6 +429,169 @@ class ForecastStore:
                 (source, start_ts, end_ts),
             ).fetchall()
         return [Forecast(**dict(zip(_FORECAST_COLS, r))) for r in rows]
+
+
+@dataclass(slots=True)
+class Weather:
+    """One hourly weather period from a forecast provider (NWS today)."""
+    period_ts: int                      # period midpoint, unix seconds
+    fetched_at: int                     # when we fetched, unix seconds
+    source: str                         # 'nws'
+    temperature_c: float | None = None
+    dewpoint_c: float | None = None
+    rel_humidity_pct: float | None = None
+    prob_precip_pct: float | None = None
+    wind_speed_mph: float | None = None
+    wind_dir: str | None = None         # cardinal, e.g. "WSW"
+    short_forecast: str | None = None   # e.g. "Sunny", "Mostly Cloudy"
+    sky_cover_pct: float | None = None  # 0-100, merged from /gridpoints
+
+
+_WEATHER_COLS = (
+    "period_ts", "fetched_at", "source",
+    "temperature_c", "dewpoint_c", "rel_humidity_pct", "prob_precip_pct",
+    "wind_speed_mph", "wind_dir", "short_forecast", "sky_cover_pct",
+)
+
+
+class WeatherStore:
+    """SQLite store for versioned hourly weather rows.
+
+    Mirrors ForecastStore: (period_ts, fetched_at, source) is the PK so
+    we keep the full history of how the forecast evolved. Readers use
+    `latest_in_range` for "what's the best estimate per hour right now".
+    """
+
+    def __init__(self, db_path: Path) -> None:
+        self._db_path = db_path
+        _init_db(db_path)
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self._db_path, isolation_level=None, timeout=5.0)
+
+    def insert_many(self, rows: list[Weather]) -> None:
+        if not rows:
+            return
+        placeholders = ", ".join("?" * len(_WEATHER_COLS))
+        payload = [
+            tuple(getattr(w, col) for col in _WEATHER_COLS) for w in rows
+        ]
+        with self._connect() as conn:
+            conn.executemany(
+                f"INSERT OR REPLACE INTO weather ({', '.join(_WEATHER_COLS)}) "
+                f"VALUES ({placeholders})",
+                payload,
+            )
+
+    def latest_in_range(
+        self, start_ts: int, end_ts: int, source: str = "nws",
+    ) -> list[Weather]:
+        """Most recent weather row per period in [start_ts, end_ts]."""
+        select_cols = ", ".join(f"w1.{c}" for c in _WEATHER_COLS)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT {select_cols}
+                FROM weather w1
+                WHERE w1.source = ?
+                  AND w1.period_ts BETWEEN ? AND ?
+                  AND w1.fetched_at = (
+                      SELECT MAX(w2.fetched_at) FROM weather w2
+                      WHERE w2.period_ts = w1.period_ts AND w2.source = w1.source
+                  )
+                ORDER BY w1.period_ts
+                """,
+                (source, start_ts, end_ts),
+            ).fetchall()
+        return [Weather(**dict(zip(_WEATHER_COLS, r))) for r in rows]
+
+    def last_fetched_at(self, source: str = "nws") -> int | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT MAX(fetched_at) FROM weather WHERE source = ?",
+                (source,),
+            ).fetchone()
+        return row[0] if row and row[0] is not None else None
+
+
+@dataclass(slots=True)
+class Observation:
+    """One past hourly weather observation from an NWS station."""
+    period_ts: int                      # top-of-hour, UTC unix seconds
+    station_id: str                     # e.g. 'KSFO'
+    fetched_at: int | None = None
+    temperature_c: float | None = None
+    dewpoint_c: float | None = None
+    rel_humidity_pct: float | None = None
+    wind_speed_mph: float | None = None
+    wind_dir: str | None = None         # cardinal, e.g. 'WSW' (from degrees)
+    text_description: str | None = None # e.g. 'Clear', 'Light Rain'
+    sky_cover_pct: float | None = None  # derived from cloudLayers amount
+
+
+_OBSERVATION_COLS = (
+    "period_ts", "station_id", "fetched_at",
+    "temperature_c", "dewpoint_c", "rel_humidity_pct",
+    "wind_speed_mph", "wind_dir", "text_description", "sky_cover_pct",
+)
+
+
+class ObservationStore:
+    """SQLite store for past hourly weather observations.
+
+    The PK is (period_ts, station_id) — past observations don't get
+    revised between fetches (NWS QC tweaks are negligible for our use),
+    so re-fetching the same hour overwrites in place. NWS only retains
+    ~7 days of observations publicly, so this table is also our local
+    long-term archive: every 5 AM fetch tops it up.
+    """
+
+    def __init__(self, db_path: Path) -> None:
+        self._db_path = db_path
+        _init_db(db_path)
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self._db_path, isolation_level=None, timeout=5.0)
+
+    def insert_many(self, rows: list[Observation]) -> None:
+        if not rows:
+            return
+        placeholders = ", ".join("?" * len(_OBSERVATION_COLS))
+        payload = [
+            tuple(getattr(o, col) for col in _OBSERVATION_COLS) for o in rows
+        ]
+        with self._connect() as conn:
+            conn.executemany(
+                f"INSERT OR REPLACE INTO observations "
+                f"({', '.join(_OBSERVATION_COLS)}) VALUES ({placeholders})",
+                payload,
+            )
+
+    def read_range(
+        self, start_ts: int, end_ts: int, station_id: str | None = None,
+    ) -> list[Observation]:
+        """All observations in [start_ts, end_ts], optionally filtered by station."""
+        select_cols = ", ".join(_OBSERVATION_COLS)
+        query = (
+            f"SELECT {select_cols} FROM observations "
+            f"WHERE period_ts BETWEEN ? AND ?"
+        )
+        args: tuple = (start_ts, end_ts)
+        if station_id is not None:
+            query += " AND station_id = ?"
+            args = (start_ts, end_ts, station_id)
+        query += " ORDER BY period_ts"
+        with self._connect() as conn:
+            rows = conn.execute(query, args).fetchall()
+        return [Observation(**dict(zip(_OBSERVATION_COLS, r))) for r in rows]
+
+    def last_fetched_at(self, station_id: str) -> int | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT MAX(fetched_at) FROM observations WHERE station_id = ?",
+                (station_id,),
+            ).fetchone()
+        return row[0] if row and row[0] is not None else None
 
 
 @dataclass(slots=True)
