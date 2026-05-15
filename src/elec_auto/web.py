@@ -531,6 +531,10 @@ def _circuits_section() -> str:
     # One polyline per circuit, broken at telemetry gaps (>90 s between
     # samples). Today's data is drawn solid in the past half; yesterday's
     # data is drawn dashed/faded in the future half as a "dumb forecast".
+    # Each segment is bracketed with a (first_x, 0) and (last_x, 0) point
+    # so it renders as a bounded "spike" with visible vertical edges at
+    # both ends, rather than a line that hangs in mid-air.
+    y0 = y_for(0)
     def draw(data: dict[str, list[tuple[int, float]]], extra_attrs: str) -> None:
         for circuit in sorted(data):
             pts = sorted(data[circuit])
@@ -550,7 +554,8 @@ def _circuits_section() -> str:
             for seg in segments:
                 if len(seg) < 2:
                     continue
-                pts_str = " ".join(f"{x:.1f},{y:.1f}" for x, y in seg)
+                edged = [(seg[0][0], y0)] + seg + [(seg[-1][0], y0)]
+                pts_str = " ".join(f"{x:.1f},{y:.1f}" for x, y in edged)
                 parts.append(
                     f'<polyline points="{pts_str}" fill="none" stroke="{color}" '
                     f'stroke-width="1.5"{extra_attrs}/>'
