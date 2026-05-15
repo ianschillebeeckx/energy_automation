@@ -17,7 +17,6 @@ from .forecast import pv_kwh_in_range
 from .policy import Decision, decide_ev_amps
 from .powerwall import PowerReading
 from .samples import Forecast
-from .solar import theoretical_day_kwh
 
 
 def _sunny_floor_pct(
@@ -25,19 +24,19 @@ def _sunny_floor_pct(
     dump_start: datetime,
     settings: Settings,
 ) -> int:
-    """Lower the morning_dump floor when today's forecast looks clear.
+    """Lower the morning_dump floor when today's forecast PV is high.
 
     Returns `morning_dump_sunny_floor_pct` if forecast PV for the day of
-    `dump_start` reaches `morning_dump_sunny_threshold_pct` of the
-    theoretical clear-sky integral, otherwise the normal floor.
+    `dump_start` clears `morning_dump_sunny_threshold_kwh`, otherwise the
+    normal floor.
 
-    TODO: replace this PV-only ratio with a simulation-based test using
-    forecast.soc_forecast(): start from the post-dump floor, integrate
-    (PV − load) forecast across the day, and lower the floor only when
+    TODO: replace this flat-kWh threshold with a simulation-based test
+    using forecast.soc_forecast(): start from the post-dump floor,
+    integrate (PV − load) across the day, and lower the floor only when
     SoC is projected to reach 100% by sunset (with a configurable
     headroom buffer). That handles cloudy days with low load, sunny
     days with heavy load (HVAC, EV trickle), and seasonal variations
-    in one principled rule instead of a static %-of-clear-sky threshold.
+    in one principled rule instead of a static threshold.
     """
     if not pv_forecasts:
         return settings.morning_dump_floor_pct
@@ -46,11 +45,7 @@ def _sunny_floor_pct(
     forecast_kwh = pv_kwh_in_range(
         pv_forecasts, int(day_start.timestamp()), int(day_end.timestamp()),
     )
-    theoretical_kwh = theoretical_day_kwh(day_start, settings)
-    if theoretical_kwh <= 0:
-        return settings.morning_dump_floor_pct
-    ratio = forecast_kwh / theoretical_kwh
-    if ratio >= settings.morning_dump_sunny_threshold_pct / 100.0:
+    if forecast_kwh >= settings.morning_dump_sunny_threshold_kwh:
         return settings.morning_dump_sunny_floor_pct
     return settings.morning_dump_floor_pct
 

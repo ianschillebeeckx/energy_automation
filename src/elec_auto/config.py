@@ -76,12 +76,13 @@ class Settings(BaseSettings):
     # back as a conservatism buffer. Bump toward 100% as forecast
     # confidence grows.
     morning_dump_pv_credit_pct: float = Field(default=90.0, ge=0.0, le=100.0)
-    # Sunny-day deep dump. When today's forecast PV reaches this fraction
-    # of the clear-sky theoretical, allow the dump to drain further than
-    # the normal floor — making more battery room for the day's
-    # generation. Disabled when no forecast data is available.
-    morning_dump_sunny_threshold_pct: float = Field(
-        default=80.0, ge=0.0, le=100.0,
+    # Sunny-day deep dump. When today's forecast PV reaches this kWh
+    # threshold, allow the dump to drain further than the normal floor —
+    # making more battery room for the day's generation. Disabled when
+    # no forecast data is available. 30 kWh ≈ a solidly sunny day at
+    # this site; cloudy days fall well below.
+    morning_dump_sunny_threshold_kwh: float = Field(
+        default=30.0, ge=0.0, le=200.0,
     )
     morning_dump_sunny_floor_pct: int = Field(default=5, ge=1, le=99)
     # Trickle mode fixed rate.

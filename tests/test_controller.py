@@ -23,6 +23,11 @@ _IN_WINDOW = datetime(2026, 4, 22, 7, 0, tzinfo=_TZ)
 
 
 def _settings(**overrides) -> Settings:
+    # NOTE: these test defaults deliberately diverge from production —
+    # floor_pct=15 and window=7→8 are picked so the math comes out to
+    # round-numbered amperages (and the dump window lives cleanly inside
+    # the test day). Production defaults live in config.py and are
+    # mirrored by .env.
     defaults = dict(
         battery_reserve_pct=80, ev_min_amps=6, ev_max_amps=40, ev_voltage=240,
         battery_capacity_kwh=13.5, morning_dump_floor_pct=15,
@@ -228,8 +233,7 @@ def _all_day_pv(date_in_window: datetime, watts: float) -> list[Forecast]:
 
 
 def test_morning_dump_sunny_floor_kicks_in_above_threshold() -> None:
-    # Theoretical for SF on Apr 22 with 30° south-facing 6.6 kW array ≈ 41 kWh.
-    # 80% threshold → 32.8 kWh. A flat 3 kW all day gives 72 kWh forecast,
+    # 30 kWh flat threshold. A flat 3 kW all day gives 72 kWh forecast,
     # well above threshold — sunny floor (default 5%) replaces the 15%.
     forecasts = _all_day_pv(_IN_WINDOW, 3000)
     d = compute_target(
@@ -243,7 +247,7 @@ def test_morning_dump_sunny_floor_kicks_in_above_threshold() -> None:
 
 
 def test_morning_dump_sunny_floor_does_not_apply_below_threshold() -> None:
-    # 100 W forecast = 2.4 kWh/day << 32.8 kWh threshold → normal 15% floor.
+    # 100 W flat = 2.4 kWh/day << 30 kWh threshold → normal 15% floor.
     forecasts = _all_day_pv(_IN_WINDOW, 100)
     d = compute_target(
         "morning_dump", _pw(soc=80), _ev(), _settings(),
