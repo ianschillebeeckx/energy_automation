@@ -255,14 +255,16 @@ def _control_tick() -> None:
     # Auto-switch morning_dump -> surplus when the dump is done, so the
     # car keeps catching daytime surplus once the battery is drained.
     if _charge_mode == "morning_dump":
-        is_active = decision.on and "dump " in decision.reason
+        # "scheduled" reasons mean we're outside the window (queued for
+        # later); anything else (dump / hold / at-floor) means we're
+        # inside it. Stripping the optional "sunny: " prefix keeps the
+        # check resilient to the sunny-day deep-dump flag.
+        bare_reason = decision.reason.removeprefix("sunny: ")
+        in_window = not bare_reason.startswith("scheduled ")
         floor_reached = "at/below floor" in decision.reason
-        # "scheduled" means we're outside the window. If we'd been active in
-        # this morning's window, that means the window just closed.
-        window_closed = "scheduled" in decision.reason and _dump_was_active
-        if is_active:
+        if in_window:
             _dump_was_active = True
-        elif floor_reached or window_closed:
+        if floor_reached or (not in_window and _dump_was_active):
             logger.info("morning_dump complete ({}) -> surplus", decision.reason)
             _charge_mode = "surplus"
             _dump_was_active = False
@@ -940,10 +942,11 @@ async def _forecast_loop() -> None:
         if future:
             next_t = min(future)
         else:
-            # All of today's slots have passed; sleep until tomorrow's 5 AM.
+            # All of today's slots have passed; sleep until tomorrow's
+            # pre-dawn slot (04:50, 10 min before the morning_dump start).
             from datetime import timedelta
             next_t = (now + timedelta(days=1)).replace(
-                hour=5, minute=0, second=0, microsecond=0,
+                hour=4, minute=50, second=0, microsecond=0,
             )
         sleep_sec = max(1.0, (next_t - now).total_seconds())
         logger.info(

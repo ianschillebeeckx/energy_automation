@@ -35,7 +35,10 @@ _OUTPUT_PARAMS = ",".join((
 ))
 
 
-_FIVE_AM_HOUR = 5
+# Fixed pre-dawn slot — runs 10 min before the morning_dump start so the
+# dump decision has the freshest possible forecast in hand.
+_PRE_DAWN_HOUR = 4
+_PRE_DAWN_MINUTE = 50
 _DAYLIGHT_SLOTS = 7  # number of fetches spread between sunrise and sunset
 
 
@@ -47,18 +50,19 @@ def daily_schedule(
     """Today's scheduled solcast fetch times in the same timezone as `now_local`.
 
     Returns:
-      1 slot at 05:00 local + 7 slots evenly placed between sunrise and
+      1 slot at 04:50 local + 7 slots evenly placed between sunrise and
       sunset (8 total, leaving 2 calls of the 10/day budget in reserve).
 
-    Falls back to just the 05:00 slot when latitude/longitude aren't set.
+    Falls back to just the pre-dawn slot when latitude/longitude aren't set.
     """
     if now_local.tzinfo is None:
         raise ValueError("now_local must be timezone-aware")
 
-    five_am = now_local.replace(
-        hour=_FIVE_AM_HOUR, minute=0, second=0, microsecond=0,
+    pre_dawn = now_local.replace(
+        hour=_PRE_DAWN_HOUR, minute=_PRE_DAWN_MINUTE,
+        second=0, microsecond=0,
     )
-    schedule: list[datetime] = [five_am]
+    schedule: list[datetime] = [pre_dawn]
 
     if latitude is None or longitude is None:
         return schedule

@@ -61,15 +61,21 @@ class Settings(BaseSettings):
     # amperage is roughly halved vs a 1 h window — gentler on the EVSE,
     # car charger, and battery.
     morning_dump_floor_pct: int = Field(default=10, ge=5, le=99)
-    morning_dump_hours: float = 2.0
-    morning_dump_start_hour: int = Field(default=6, ge=0, le=23)
+    morning_dump_start_hour: int = Field(default=5, ge=0, le=23)
     morning_dump_start_minute: int = Field(default=0, ge=0, le=59)
-    # Conservative discount applied to the Solcast PV forecast when sizing
-    # the morning-dump rate. At 90%, only 10% of the forecast PV between
-    # now and the window end is treated as "guaranteed" extra headroom on
-    # top of the battery SoC headroom. Bump down toward 0% as confidence
-    # in the local forecast grows.
-    morning_dump_pv_discount_pct: float = Field(default=90.0, ge=0.0, le=100.0)
+    morning_dump_end_hour: int = Field(default=8, ge=0, le=23)
+    morning_dump_end_minute: int = Field(default=0, ge=0, le=59)
+    # Ceiling on dump amperage. The PW3 inverter sustains ~11.5 kW AC of
+    # combined solar+battery → home; HVAC pulses can hit 4.5 kW. Capping
+    # the EV at 29 A (~7 kW) leaves room for the HVAC + a bit of base
+    # load without forcing grid import.
+    morning_dump_max_amps: int = Field(default=29, ge=6, le=40)
+    # Fraction of the Solcast PV forecast credited toward the dump
+    # headroom. At 90%, 90% of the forecast PV between now and the window
+    # end is added to the battery SoC headroom; the remaining 10% is held
+    # back as a conservatism buffer. Bump toward 100% as forecast
+    # confidence grows.
+    morning_dump_pv_credit_pct: float = Field(default=90.0, ge=0.0, le=100.0)
     # Sunny-day deep dump. When today's forecast PV reaches this fraction
     # of the clear-sky theoretical, allow the dump to drain further than
     # the normal floor — making more battery room for the day's

@@ -62,17 +62,26 @@ def _next_dump_window(now: datetime, settings: Settings) -> tuple[datetime, date
     If today's window has already ended, returns tomorrow's. This lets the
     user click the button in the evening and have the schedule fire at
     the next morning's start time.
+
+    Start and end are both wall-clock anchored, so they roll together
+    across midnight if the user ever configures an overnight window.
     """
     start_today = now.replace(
         hour=settings.morning_dump_start_hour,
         minute=settings.morning_dump_start_minute,
         second=0, microsecond=0,
     )
-    end_today = start_today + timedelta(hours=settings.morning_dump_hours)
+    end_today = now.replace(
+        hour=settings.morning_dump_end_hour,
+        minute=settings.morning_dump_end_minute,
+        second=0, microsecond=0,
+    )
     if now < end_today:
         return start_today, end_today
-    start_tomorrow = start_today + timedelta(days=1)
-    return start_tomorrow, start_tomorrow + timedelta(hours=settings.morning_dump_hours)
+    return (
+        start_today + timedelta(days=1),
+        end_today + timedelta(days=1),
+    )
 
 
 def compute_target(
@@ -118,14 +127,15 @@ def compute_target(
         start, end = _next_dump_window(now_local, settings)
 
         # Forecast PV between now and the window end adds to the headroom
-        # we have to drain; discount heavily for conservatism.
-        discount = 1.0 - settings.morning_dump_pv_discount_pct / 100.0
+        # we have to drain. Credit only `morning_dump_pv_credit_pct` of the
+        # raw forecast so the rate stays slightly conservative.
+        credit = settings.morning_dump_pv_credit_pct / 100.0
         raw_pv_kwh = pv_kwh_in_range(
             pv_forecasts or [],
             int(max(now_local, start).timestamp()),
             int(end.timestamp()),
         )
-        forecast_kwh = raw_pv_kwh * discount
+        forecast_kwh = raw_pv_kwh * credit
 
         # Sunny-day deep dump: when today's full-day forecast clears the
         # threshold of the theoretical max, drain to a lower floor so the
@@ -136,8 +146,9 @@ def compute_target(
         if now_local < start:
             # Scheduled — preview the rate at full-window duration so the
             # dashboard shows what the charger is configured for.
+            full_window_hr = (end - start).total_seconds() / 3600.0
             amps, _ = _dump_amps_for(
-                pw, settings.morning_dump_hours, settings, forecast_kwh,
+                pw, full_window_hr, settings, forecast_kwh,
                 floor_pct=floor_pct,
             )
             reason = f"scheduled {start:%a %H:%M}"
@@ -183,13 +194,20 @@ def _dump_amps_for(
         return 0, f"SoC {pw.battery_soc_pct:.0f}% at/below floor {floor}%"
     headroom = battery_kwh + forecast_kwh
     kw = headroom / window_hours
-    amps = int(kw * 1000 / settings.ev_voltage)
-    amps = max(settings.ev_min_amps, min(settings.ev_max_amps, amps))
-    if forecast_kwh > 0:
-        reason = (
-            f"dump {battery_kwh:.1f}+{forecast_kwh:.1f} kWh in "
-            f"{window_hours:.2f} h -> {amps} A"
+    raw_amps = int(kw * 1000 / settings.ev_voltage)
+    # Round *down* to off rather than up to ev_min_amps. Pulling 6 A out
+    # of a battery whose natural rate would be 2 A drains it faster than
+    # the dump's intended pace — better to idle and save the headroom for
+    # HVAC / base load. As the remaining window shrinks the natural rate
+    # rises, and the dump fires once it reaches the minimum.
+    if raw_amps < settings.ev_min_amps:
+        return 0, (
+            f"hold: natural {raw_amps} A < min {settings.ev_min_amps} A "
+            f"(SoC {pw.battery_soc_pct:.0f}% > floor {floor}%)"
         )
-    else:
-        reason = f"dump {battery_kwh:.1f} kWh in {window_hours:.2f} h -> {amps} A"
+    amps = min(raw_amps, settings.ev_max_amps, settings.morning_dump_max_amps)
+    reason = (
+        f"dump {battery_kwh:.1f}+{forecast_kwh:.1f} kWh in "
+        f"{window_hours:.2f} h -> {amps} A"
+    )
     return amps, reason

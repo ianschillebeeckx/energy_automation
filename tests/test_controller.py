@@ -26,13 +26,18 @@ def _settings(**overrides) -> Settings:
     defaults = dict(
         battery_reserve_pct=80, ev_min_amps=6, ev_max_amps=40, ev_voltage=240,
         battery_capacity_kwh=13.5, morning_dump_floor_pct=15,
-        morning_dump_hours=1.0, morning_dump_start_hour=7, trickle_kw=2.0,
+        morning_dump_start_hour=7, morning_dump_start_minute=0,
+        morning_dump_end_hour=8, morning_dump_end_minute=0,
+        trickle_kw=2.0,
         timezone="America/Los_Angeles",
         # The sunny-floor logic queries theoretical_day_kwh which needs
         # coordinates. Pin to a real location so it returns nonzero.
         latitude=37.736015, longitude=-122.452026,
         solar_array_max_kw=6.6, solar_panel_azimuth_deg=180.0,
         solar_panel_tilt_deg=30.0, solar_system_loss_factor=0.09,
+        # Lift the inverter-headroom ceiling for tests that aren't
+        # exercising it — they should be free to reach ev_max_amps.
+        morning_dump_max_amps=40,
     )
     defaults.update(overrides)
     return Settings(_env_file=None, **defaults)  # type: ignore[arg-type]
@@ -79,11 +84,11 @@ def test_morning_dump_below_floor_returns_zero() -> None:
 
 
 def test_morning_dump_respects_longer_window() -> None:
-    # 65% headroom over 4 h -> ~9 A. A 7:00 click with a 4 h window keeps
-    # us at the start of the window so remaining hours == configured hours.
+    # 65% headroom over 4 h -> ~9 A. A 7:00 click into a 7→11 window
+    # keeps us at the start, so remaining hours == window duration.
     d = compute_target(
         "morning_dump", _pw(soc=80), _ev(),
-        _settings(morning_dump_hours=4.0), now=_IN_WINDOW,
+        _settings(morning_dump_end_hour=11), now=_IN_WINDOW,
     )
     assert d.target_amps == 9
 
@@ -157,46 +162,58 @@ def _flat_pv(period_start_ts: int, period_end_ts: int, watts: float) -> list[For
     return out
 
 
-def test_morning_dump_adds_discounted_forecast_to_headroom() -> None:
+def test_morning_dump_credits_partial_forecast_to_headroom() -> None:
     # 1 h window at SoC 80%, floor 15% → battery_kwh = 8.775.
-    # 2 kW PV forecast over 1 h → 2 kWh raw. Discount 90% → 0.2 kWh added.
-    # Total headroom 8.975 kWh / 1 h → 37 A (vs 36 A without forecast).
+    # 2 kW PV forecast over 1 h → 2 kWh raw. Credit 90% → 1.8 kWh added.
+    # Total headroom 10.575 kWh / 1 h → 44 A → clamped to ev_max_amps=40.
     start = int(_IN_WINDOW.timestamp())
     end = start + 3600
     forecasts = _flat_pv(start, end, 2000)
     d = compute_target(
         "morning_dump", _pw(soc=80), _ev(),
-        _settings(morning_dump_pv_discount_pct=90.0),
+        _settings(morning_dump_pv_credit_pct=90.0),
         now=_IN_WINDOW, pv_forecasts=forecasts,
     )
-    assert d.target_amps == 37
-    assert "+0.2 kWh" in d.reason
+    assert d.target_amps == 40
+    assert "+1.8 kWh" in d.reason
 
 
-def test_morning_dump_uses_full_forecast_when_no_discount() -> None:
-    # Same as above but discount=0 → full 2 kWh added → 10.775 kWh / 1 h
-    # = 44.9 A → clamped to ev_max_amps=40.
+def test_morning_dump_full_forecast_credit() -> None:
+    # credit=100 → full 2 kWh added → 10.775 kWh / 1 h = 44.9 A → 40 A clamp.
     start = int(_IN_WINDOW.timestamp())
     end = start + 3600
     forecasts = _flat_pv(start, end, 2000)
     d = compute_target(
         "morning_dump", _pw(soc=80), _ev(),
-        _settings(morning_dump_pv_discount_pct=0.0),
+        _settings(morning_dump_pv_credit_pct=100.0),
         now=_IN_WINDOW, pv_forecasts=forecasts,
     )
     assert d.target_amps == 40
     assert "+2.0 kWh" in d.reason
 
 
+def test_morning_dump_zero_credit_ignores_forecast() -> None:
+    # credit=0 → identical to "no forecast" behavior: 8.775 kWh / 1 h → 36 A.
+    start = int(_IN_WINDOW.timestamp())
+    end = start + 3600
+    forecasts = _flat_pv(start, end, 2000)
+    d = compute_target(
+        "morning_dump", _pw(soc=80), _ev(),
+        _settings(morning_dump_pv_credit_pct=0.0),
+        now=_IN_WINDOW, pv_forecasts=forecasts,
+    )
+    assert d.target_amps == 36
+    assert "+0.0 kWh" in d.reason  # forecast slot present but empty
+
+
 def test_morning_dump_unaffected_when_forecast_missing() -> None:
-    # Default discount 90%; without any forecast we get the legacy
-    # battery-only behavior, matching the original test.
+    # No forecast list → 0 kWh credited; battery-only headroom drives the rate.
     d = compute_target(
         "morning_dump", _pw(soc=80), _ev(), _settings(), now=_IN_WINDOW,
         pv_forecasts=None,
     )
     assert d.target_amps == 36
-    assert "+" not in d.reason  # no forecast contribution surfaced
+    assert "+0.0 kWh" in d.reason
 
 
 def _all_day_pv(date_in_window: datetime, watts: float) -> list[Forecast]:
@@ -264,6 +281,49 @@ def test_morning_dump_sunny_floor_lets_dump_run_past_normal_floor() -> None:
     assert d_sunny.target_amps > 0
     assert d_normal.target_amps == 0
     assert "at/below floor 15%" in d_normal.reason
+
+
+def test_morning_dump_holds_when_natural_rate_below_min() -> None:
+    # SoC 20%, floor 10%, 05:30→08:00 window, no forecast → battery_kwh = 1.35,
+    # natural kW = 0.54, unclamped amps = 2. Old behavior would round up to
+    # the 6 A clamp; new behavior holds at 0 to preserve battery headroom.
+    start = datetime(2026, 5, 16, 5, 30, tzinfo=_TZ)
+    d = compute_target(
+        "morning_dump", _pw(soc=20), _ev(),
+        _settings(morning_dump_floor_pct=10,
+                  morning_dump_start_hour=5, morning_dump_start_minute=30,
+                  morning_dump_end_hour=8, morning_dump_end_minute=0),
+        now=start, pv_forecasts=None,
+    )
+    assert d.target_amps == 0
+    assert d.on is False
+    assert "hold:" in d.reason
+
+
+def test_morning_dump_fires_once_natural_rate_reaches_min() -> None:
+    # Same starting state but late in the window — remaining_hr collapses,
+    # so the same headroom now exceeds the min-amp threshold.
+    near_end = datetime(2026, 5, 16, 7, 30, tzinfo=_TZ)  # 30 min left in window
+    d = compute_target(
+        "morning_dump", _pw(soc=20), _ev(),
+        _settings(morning_dump_floor_pct=10,
+                  morning_dump_start_hour=5, morning_dump_start_minute=30,
+                  morning_dump_end_hour=8, morning_dump_end_minute=0),
+        now=near_end, pv_forecasts=None,
+    )
+    # battery_kwh = 1.35 / 0.5 h = 2.7 kW = 11 A
+    assert d.target_amps >= 6
+    assert d.reason.startswith("dump")
+
+
+def test_morning_dump_caps_at_max_amps() -> None:
+    # SoC 80%, 1 h window → unclamped would be 36 A; max_amps=29 clamps it.
+    d = compute_target(
+        "morning_dump", _pw(soc=80), _ev(),
+        _settings(morning_dump_max_amps=29),
+        now=_IN_WINDOW,
+    )
+    assert d.target_amps == 29
 
 
 def test_unknown_mode_is_zero() -> None:
