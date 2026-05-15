@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS samples (
     theoretical_w   REAL,
     charger_amps    INTEGER,
     charger_on      INTEGER,
+    charger_status  TEXT,
     pw_ok           INTEGER,
     em_ok           INTEGER,
     mode            TEXT,
@@ -107,6 +108,7 @@ _SAMPLES_MIGRATIONS: list[tuple[str, str]] = [
     ("decision_amps", "INTEGER"),
     ("decision_on", "INTEGER"),
     ("decision_reason", "TEXT"),
+    ("charger_status", "TEXT"),
 ]
 
 
@@ -140,6 +142,7 @@ class Sample:
     theoretical_w: float | None
     charger_amps: int | None = None
     charger_on: bool | None = None
+    charger_status: str | None = None  # Emporia EVSE status (e.g. "Charging")
     pw_ok: bool | None = None
     em_ok: bool | None = None
     mode: str | None = None
@@ -193,15 +196,16 @@ class SampleStore:
                 """
                 INSERT OR REPLACE INTO samples
                 (ts, solar_w, load_w, battery_w, grid_w, soc_pct,
-                 theoretical_w, charger_amps, charger_on,
+                 theoretical_w, charger_amps, charger_on, charger_status,
                  pw_ok, em_ok, mode, decision_amps, decision_on, decision_reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     sample.ts, sample.solar_w, sample.load_w, sample.battery_w,
                     sample.grid_w, sample.soc_pct, sample.theoretical_w,
                     sample.charger_amps,
                     _bool(sample.charger_on),
+                    sample.charger_status,
                     _bool(sample.pw_ok), _bool(sample.em_ok), sample.mode,
                     sample.decision_amps, _bool(sample.decision_on),
                     sample.decision_reason,
@@ -228,7 +232,7 @@ class SampleStore:
             rows = conn.execute(
                 """
                 SELECT ts, solar_w, load_w, battery_w, grid_w, soc_pct,
-                       theoretical_w, charger_amps, charger_on,
+                       theoretical_w, charger_amps, charger_on, charger_status,
                        pw_ok, em_ok, mode, decision_amps, decision_on,
                        decision_reason
                 FROM samples WHERE ts BETWEEN ? AND ? ORDER BY ts
@@ -244,9 +248,10 @@ class SampleStore:
                 ts=r[0], solar_w=r[1], load_w=r[2], battery_w=r[3], grid_w=r[4],
                 soc_pct=r[5], theoretical_w=r[6],
                 charger_amps=r[7], charger_on=_opt_bool(r[8]),
-                pw_ok=_opt_bool(r[9]), em_ok=_opt_bool(r[10]), mode=r[11],
-                decision_amps=r[12], decision_on=_opt_bool(r[13]),
-                decision_reason=r[14],
+                charger_status=r[9],
+                pw_ok=_opt_bool(r[10]), em_ok=_opt_bool(r[11]), mode=r[12],
+                decision_amps=r[13], decision_on=_opt_bool(r[14]),
+                decision_reason=r[15],
             )
             for r in rows
         ]

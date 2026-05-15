@@ -20,7 +20,7 @@ from bisect import bisect_left
 from dataclasses import dataclass
 
 from .config import Settings
-from .samples import Forecast, SampleStore
+from .samples import Forecast, LoadStore, SampleStore
 
 _DAY_SEC = 24 * 3600
 
@@ -47,6 +47,57 @@ def load_forecast(
         for s in src
         if s.load_w is not None and s.load_w >= 0
     ]
+
+
+def _integrate_ts_w(
+    points: list[tuple[int, float]], start_ts: int, end_ts: int,
+) -> float:
+    """Trapezoidal integral of (ts, watts) over [start_ts, end_ts] → kWh.
+
+    5-min step with linear interp between bracketing samples; returns 0
+    when the window is empty/inverted or the points list is empty.
+    """
+    if end_ts <= start_ts or not points:
+        return 0.0
+    step = 300
+    total_kwh = 0.0
+    t = start_ts
+    while t < end_ts:
+        t_next = min(t + step, end_ts)
+        avg_w = (_interp(points, t) + _interp(points, t_next)) / 2.0
+        total_kwh += avg_w * (t_next - t) / 3600.0 / 1000.0
+        t = t_next
+    return total_kwh
+
+
+def non_ev_load_kwh_in_window(
+    samples: SampleStore,
+    loads: LoadStore,
+    start_ts: int,
+    end_ts: int,
+    ev_circuit_name: str = "EV Charger",
+) -> float:
+    """Yesterday's non-EV load in `[start_ts, end_ts]` (shifted -24 h).
+
+    Integrates the PW3-reported `load_w` over yesterday's same-window
+    and subtracts the integrated Emporia EV-circuit draw for the same
+    period. Both inputs are real measurements — no configured-rate or
+    status assumptions. Returns kWh, clamped at 0 if the EV circuit
+    happens to integrate higher than total load (sensor noise).
+    """
+    yest_lo, yest_hi = start_ts - _DAY_SEC, end_ts - _DAY_SEC
+    house_pts = [
+        (s.ts, s.load_w)
+        for s in samples.read_range(yest_lo, yest_hi)
+        if s.load_w is not None and s.load_w >= 0
+    ]
+    ev_pts = [
+        (r.ts, r.watts)
+        for r in loads.read_range(yest_lo, yest_hi, circuit=ev_circuit_name)
+    ]
+    house_kwh = _integrate_ts_w(house_pts, yest_lo, yest_hi)
+    ev_kwh = _integrate_ts_w(ev_pts, yest_lo, yest_hi)
+    return max(0.0, house_kwh - ev_kwh)
 
 
 def _interp(points: list[tuple[int, float]], ts: int, default: float = 0.0) -> float:
@@ -93,6 +144,28 @@ def pv_kwh_in_range(
     )
     if not pts:
         return 0.0
+    step = 300
+    total_kwh = 0.0
+    t = start_ts
+    while t < end_ts:
+        t_next = min(t + step, end_ts)
+        avg_w = (_interp(pts, t) + _interp(pts, t_next)) / 2.0
+        total_kwh += avg_w * (t_next - t) / 3600.0 / 1000.0
+        t = t_next
+    return total_kwh
+
+
+def load_kwh_in_range(
+    load_forecasts: list[LoadForecast], start_ts: int, end_ts: int,
+) -> float:
+    """Integrate forecast load watts over [start_ts, end_ts] → kWh.
+
+    Same trapezoidal-at-5-min-steps shape as `pv_kwh_in_range`. Returns
+    0 when end<=start or there's no forecast data overlapping the window.
+    """
+    if end_ts <= start_ts or not load_forecasts:
+        return 0.0
+    pts = [(lf.ts, lf.load_w) for lf in load_forecasts]
     step = 300
     total_kwh = 0.0
     t = start_ts

@@ -180,7 +180,7 @@ def test_morning_dump_credits_partial_forecast_to_headroom() -> None:
         now=_IN_WINDOW, pv_forecasts=forecasts,
     )
     assert d.target_amps == 40
-    assert "+1.8 kWh" in d.reason
+    assert "+1.8-0.0 kWh" in d.reason  # pv credit, no load forecast passed
 
 
 def test_morning_dump_full_forecast_credit() -> None:
@@ -194,7 +194,7 @@ def test_morning_dump_full_forecast_credit() -> None:
         now=_IN_WINDOW, pv_forecasts=forecasts,
     )
     assert d.target_amps == 40
-    assert "+2.0 kWh" in d.reason
+    assert "+2.0-0.0 kWh" in d.reason
 
 
 def test_morning_dump_zero_credit_ignores_forecast() -> None:
@@ -208,7 +208,7 @@ def test_morning_dump_zero_credit_ignores_forecast() -> None:
         now=_IN_WINDOW, pv_forecasts=forecasts,
     )
     assert d.target_amps == 36
-    assert "+0.0 kWh" in d.reason  # forecast slot present but empty
+    assert "+0.0-0.0 kWh" in d.reason  # forecast slot present but empty
 
 
 def test_morning_dump_unaffected_when_forecast_missing() -> None:
@@ -218,7 +218,20 @@ def test_morning_dump_unaffected_when_forecast_missing() -> None:
         pv_forecasts=None,
     )
     assert d.target_amps == 36
-    assert "+0.0 kWh" in d.reason
+    assert "+0.0-0.0 kWh" in d.reason
+
+
+def test_morning_dump_subtracts_non_ev_load_kwh() -> None:
+    # 1 h window at SoC 80%, floor 15% → battery_kwh = 8.775.
+    # No PV credit, but 1 kWh of forecasted non-EV load subtracts from
+    # headroom → 7.775 kWh / 1 h → 32 A.
+    d = compute_target(
+        "morning_dump", _pw(soc=80), _ev(),
+        _settings(morning_dump_pv_credit_pct=0.0),
+        now=_IN_WINDOW, pv_forecasts=None, non_ev_load_forecast=1.0,
+    )
+    assert d.target_amps == 32
+    assert "-1.0 kWh" in d.reason
 
 
 def _all_day_pv(date_in_window: datetime, watts: float) -> list[Forecast]:

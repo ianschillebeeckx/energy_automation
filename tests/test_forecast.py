@@ -6,7 +6,8 @@ from pathlib import Path
 
 from elec_auto.config import Settings
 from elec_auto.forecast import (
-    LoadForecast, SocForecast, load_forecast, pv_kwh_in_range, soc_forecast,
+    LoadForecast, SocForecast, load_forecast, load_kwh_in_range,
+    pv_kwh_in_range, soc_forecast,
 )
 from elec_auto.samples import Forecast, Sample, SampleStore
 
@@ -22,10 +23,14 @@ def _store(tmp_path: Path) -> SampleStore:
     return SampleStore(tmp_path / "samples.db")
 
 
-def _sample(ts: int, load_w: float | None) -> Sample:
+def _sample(
+    ts: int, load_w: float | None,
+    *, charger_amps: int | None = None, charger_on: bool | None = None,
+) -> Sample:
     return Sample(
         ts=ts, solar_w=None, load_w=load_w, battery_w=None, grid_w=None,
         soc_pct=None, theoretical_w=None,
+        charger_amps=charger_amps, charger_on=charger_on,
     )
 
 
@@ -53,6 +58,52 @@ def test_load_forecast_skips_negative_load(tmp_path: Path) -> None:
     s.insert(_sample(1030, 500.0))
     out = load_forecast(s, start_ts=_DAY, end_ts=_DAY + 2000)
     assert [f.load_w for f in out] == [500.0]
+
+
+# --- non_ev_load_kwh_in_window ----------------------------------------------
+
+
+def test_non_ev_load_kwh_subtracts_ev_circuit(tmp_path: Path) -> None:
+    # Yesterday at 0-1 h: house load 3 kW flat, EV circuit 2 kW flat.
+    # Today's same-window query should give (3 − 2) × 1 h = 1.0 kWh.
+    from elec_auto.forecast import non_ev_load_kwh_in_window
+    from elec_auto.samples import LoadStore
+    s = _store(tmp_path)
+    ls = LoadStore(tmp_path / "samples.db")
+    for t in range(0, 3600 + 1, 60):  # one sample per minute
+        s.insert(_sample(t, 3000.0))
+        ls.insert_tick(t, {"EV Charger": 2000.0})
+    out = non_ev_load_kwh_in_window(
+        s, ls, start_ts=_DAY, end_ts=_DAY + 3600, ev_circuit_name="EV Charger",
+    )
+    assert abs(out - 1.0) < 1e-3
+
+
+def test_non_ev_load_kwh_clamps_when_ev_exceeds_house(tmp_path: Path) -> None:
+    # If the EV circuit integrates higher than total load (sensor
+    # noise), the result clamps at 0 rather than going negative.
+    from elec_auto.forecast import non_ev_load_kwh_in_window
+    from elec_auto.samples import LoadStore
+    s = _store(tmp_path)
+    ls = LoadStore(tmp_path / "samples.db")
+    for t in range(0, 3600 + 1, 60):
+        s.insert(_sample(t, 1000.0))
+        ls.insert_tick(t, {"EV Charger": 2000.0})
+    out = non_ev_load_kwh_in_window(
+        s, ls, start_ts=_DAY, end_ts=_DAY + 3600,
+    )
+    assert out == 0.0
+
+
+def test_non_ev_load_kwh_zero_when_no_data(tmp_path: Path) -> None:
+    from elec_auto.forecast import non_ev_load_kwh_in_window
+    from elec_auto.samples import LoadStore
+    s = _store(tmp_path)
+    ls = LoadStore(tmp_path / "samples.db")
+    out = non_ev_load_kwh_in_window(
+        s, ls, start_ts=_DAY, end_ts=_DAY + 3600,
+    )
+    assert out == 0.0
 
 
 # --- shared helpers for pv_kwh_in_range / soc_forecast -----------------------
@@ -102,6 +153,21 @@ def test_pv_kwh_in_range_skips_periods_outside_data_span() -> None:
     # Forecast only covers 1000..2000; querying 3000..4000 → 0.
     forecasts = _const_pv(1000, 2000, 5000)
     assert pv_kwh_in_range(forecasts, 3000, 4000) == 0.0
+
+
+# --- load_kwh_in_range -------------------------------------------------------
+
+
+def test_load_kwh_in_range_constant_one_kw_for_one_hour() -> None:
+    load = _const_load(0, 3600, 1000)
+    assert abs(load_kwh_in_range(load, 0, 3600) - 1.0) < 1e-6
+
+
+def test_load_kwh_in_range_zero_when_empty_or_inverted() -> None:
+    assert load_kwh_in_range([], 0, 3600) == 0.0
+    load = _const_load(0, 3600, 500)
+    assert load_kwh_in_range(load, 1000, 1000) == 0.0
+    assert load_kwh_in_range(load, 1000, 500) == 0.0
 
 
 # --- soc_forecast ------------------------------------------------------------

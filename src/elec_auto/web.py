@@ -22,7 +22,9 @@ from .config import settings
 from .controller import compute_target
 from .emporia import ChargerState, Emporia
 from .flow import Flows, decompose
+from .controller import next_dump_window
 from .forecast import load_forecast as _load_forecast
+from .forecast import non_ev_load_kwh_in_window as _non_ev_load_kwh
 from .forecast import soc_forecast as _soc_forecast
 from .nws import NWS
 from .policy import Decision
@@ -201,8 +203,7 @@ def _next_dump_start(s) -> datetime:
     """Wall-clock moment when the next morning-dump window opens."""
     from zoneinfo import ZoneInfo
 
-    from .controller import _next_dump_window
-    return _next_dump_window(datetime.now(ZoneInfo(s.timezone)), s)[0]
+    return next_dump_window(datetime.now(ZoneInfo(s.timezone)), s)[0]
 
 
 def _apply_target(decision: Decision) -> None:
@@ -241,15 +242,28 @@ def _control_tick() -> None:
         return  # hands off: leave the EVSE entirely under manual control
     pw, _ = _safe_pw()
     ev, _ = _safe_em()
-    # Operational PV forecasts: only the morning_dump mode uses these, but
-    # the call is cheap and including them unconditionally keeps the
-    # controller signature uniform across modes.
+    # Operational PV forecasts + integrated non-EV load (from yesterday's
+    # measured PW3 load minus measured EV circuit draw, sliced to the
+    # upcoming dump window). Only morning_dump uses these, but the
+    # lookups are cheap and passing them unconditionally keeps the
+    # controller signature uniform.
     now_ts = int(time.time())
     pv_forecasts = _forecast_store().operational_in_range(
         now_ts, now_ts + 24 * 3600,
     )
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(settings.timezone)
+    dump_start, dump_end = next_dump_window(datetime.now(tz), settings)
+    window_lo = max(now_ts, int(dump_start.timestamp()))
+    window_hi = int(dump_end.timestamp())
+    non_ev_load_forecast = _non_ev_load_kwh(
+        _sample_store(), _load_store(), window_lo, window_hi,
+        ev_circuit_name=(ev.name if ev else "EV Charger"),
+    )
     decision = compute_target(
-        _charge_mode, pw, ev, settings, pv_forecasts=pv_forecasts,
+        _charge_mode, pw, ev, settings,
+        pv_forecasts=pv_forecasts,
+        non_ev_load_forecast=non_ev_load_forecast,
     )
 
     # Auto-switch morning_dump -> surplus when the dump is done, so the
@@ -269,7 +283,9 @@ def _control_tick() -> None:
             _charge_mode = "surplus"
             _dump_was_active = False
             decision = compute_target(
-                _charge_mode, pw, ev, settings, pv_forecasts=pv_forecasts,
+                _charge_mode, pw, ev, settings,
+                pv_forecasts=pv_forecasts,
+                non_ev_load_forecast=non_ev_load_forecast,
             )
 
     # Auto-switch surplus -> morning_dump once we cross today's astronomical
@@ -881,6 +897,7 @@ def _record_sample(
         theoretical_w=theoretical,
         charger_amps=ev.charge_rate_a if ev else None,
         charger_on=ev.on if ev else None,
+        charger_status=ev.status if ev else None,
         pw_ok=pw is not None,
         em_ok=ev is not None,
         mode=mode,
