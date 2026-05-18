@@ -211,36 +211,13 @@ class MorningDump:
         return s.morning_dump_floor_pct
 
 
-class Trickle:
-    """Fixed-rate charge regardless of conditions.
-
-    Useful when the user wants a deterministic top-up (e.g., to a
-    pre-trip SoC). Sits below Surplus and MorningDump in priority so
-    those win when applicable.
-    """
-
-    name = "trickle"
-    priority = 10
-    enabled_setting = "trickle_enabled"
-
-    def applies(self, state: State, ctx: ActionContext) -> bool:
-        # Trickle is unconditional once enabled.
-        return True
-
-    def decide(self, state: State, ctx: ActionContext) -> Decision:
-        s = ctx.settings
-        target_amps = int(s.trickle_kw * 1000.0 / s.ev_voltage)
-        target_amps = max(s.ev_min_amps, min(s.ev_max_amps, target_amps))
-        return Decision(
-            target_amps, f"trickle {s.trickle_kw:.1f} kW -> {target_amps} A",
-            on=True,
-        )
-
-
 # Default action roster. Order doesn't matter (priority decides winners),
 # but listing high-priority first reads naturally.
+#
+# The old "off" / "manual" / "trickle" modes are deliberately not actions
+# in the new world — the user disables automation entirely via the
+# Controller's kill_switch and sets EVSE amperage from the Emporia app.
 DEFAULT_ACTIONS: list[Action] = [
     MorningDump(),
     Surplus(),
-    Trickle(),
 ]

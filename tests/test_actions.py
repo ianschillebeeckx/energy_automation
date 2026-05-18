@@ -14,7 +14,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from elec_auto.actions import (
-    DEFAULT_ACTIONS, ActionContext, MorningDump, Surplus, Trickle,
+    DEFAULT_ACTIONS, ActionContext, MorningDump, Surplus,
 )
 from elec_auto.config import Settings
 from elec_auto.samples import Forecast, LoadStore, Sample, SampleStore
@@ -383,45 +383,9 @@ def test_morning_dump_decide_clamps_to_max_amps() -> None:
     assert d.on is True
 
 
-# --- Trickle -----------------------------------------------------------------
-
-
-def test_trickle_applies_always_true() -> None:
-    a = Trickle()
-    assert a.applies(_state(), _ctx()) is True
-    # No SoC, no solar, no load — still applies.
-    assert a.applies(
-        _state(soc=None, solar=None, load=None), _ctx(),
-    ) is True
-
-
-def test_trickle_decide_default_2_kw_to_8_amps() -> None:
-    a = Trickle()
-    d = a.decide(_state(), _ctx(settings=_settings(trickle_kw=2.0)))
-    # 2000 W / 240 V = 8.33 -> 8 A, within [6, 40] -> 8.
-    assert d.target_amps == 8
-    assert d.on is True
-
-
-def test_trickle_decide_clamps_below_min() -> None:
-    a = Trickle()
-    d = a.decide(_state(), _ctx(settings=_settings(trickle_kw=0.5)))
-    # 500 W / 240 V = 2 -> clamp up to ev_min_amps = 6.
-    assert d.target_amps == 6
-    assert d.on is True
-
-
-def test_trickle_decide_clamps_above_max() -> None:
-    a = Trickle()
-    d = a.decide(_state(), _ctx(settings=_settings(trickle_kw=20.0)))
-    # 20000 / 240 = 83 -> clamp down to ev_max_amps = 40.
-    assert d.target_amps == 40
-    assert d.on is True
-
-
 # --- DEFAULT_ACTIONS roster --------------------------------------------------
 
 
-def test_default_actions_contains_three_known_actions() -> None:
+def test_default_actions_contains_two_known_actions() -> None:
     names = {type(a).__name__ for a in DEFAULT_ACTIONS}
-    assert names == {"MorningDump", "Surplus", "Trickle"}
+    assert names == {"MorningDump", "Surplus"}

@@ -42,10 +42,8 @@ def _settings(**overrides) -> Settings:
         morning_dump_start_minute=0,
         morning_dump_end_hour=8,
         morning_dump_end_minute=0,
-        trickle_kw=2.0,
         surplus_enabled=True,
         morning_dump_enabled=True,
-        trickle_enabled=False,
     )
     defaults.update(overrides)
     return Settings(_env_file=None, **defaults)  # type: ignore[arg-type]
@@ -420,11 +418,7 @@ def test_scenario_5_morning_dump_disabled_does_not_let_surplus_run_in_window() -
     the dump window with morning_dump_enabled=False the result is
     still "no action applies", even with abundant solar.
     """
-    s = _settings(
-        morning_dump_enabled=False,
-        surplus_enabled=True,
-        trickle_enabled=False,
-    )
+    s = _settings(morning_dump_enabled=False, surplus_enabled=True)
     ctl = Controller(s)
 
     # 06:00 — inside the 05:00-08:00 dump window. Solar 0: no surplus,
@@ -471,35 +465,31 @@ def test_scenario_5_morning_dump_disabled_does_not_let_surplus_run_in_window() -
     assert "surplus" in d3.reason
 
 
-# --- Scenario 6: trickle_enabled wins when others off -----------------------
+# --- Scenario 6: automation disabled -----------------------------------------
 
 
-def test_scenario_6_trickle_wins_when_others_disabled() -> None:
-    """With surplus and morning_dump off, Trickle is unconditional."""
-    s = _settings(
-        surplus_enabled=False,
-        morning_dump_enabled=False,
-        trickle_enabled=True,
-        trickle_kw=2.0,
-    )
+def test_scenario_6_all_actions_disabled_no_command() -> None:
+    """With both actions disabled, the Controller never pushes an EVSE
+    command — neither surplus during the day nor dump in the window.
+    Equivalent to the old off/manual/trickle modes (the user controls
+    the EVSE via Emporia)."""
+    s = _settings(surplus_enabled=False, morning_dump_enabled=False)
     ctl = Controller(s)
 
-    # Mid-afternoon, anything goes — trickle fires.
+    # Mid-afternoon, sunny — surplus would fire, but it's disabled.
     t1 = datetime(2026, 5, 13, 14, 0, tzinfo=_TZ)
     d1 = ctl.tick(
         t1,
-        pw=_pw(soc=50, solar=5000, load=1000),
+        pw=_pw(soc=99, solar=6000, load=1000),
         em_load_w=1000,
         ev=_ev(on=False, amps=0),
         pv_forecasts=[],
     )
-    # 2000 W / 240 V = 8 A, within [6, 40].
-    assert d1.target_amps == 8
-    assert d1.on is True
-    assert "trickle" in d1.reason
+    assert d1.target_amps == 0
+    assert d1.on is False
+    assert "no action applies" in d1.reason
 
-    # Inside the dump window (06:00) trickle still fires — its applies()
-    # is unconditional and the dump action is disabled.
+    # Inside the dump window — dump would fire, but it's disabled too.
     t2 = datetime(2026, 5, 13, 6, 0, tzinfo=_TZ)
     d2 = ctl.tick(
         t2,
@@ -508,31 +498,6 @@ def test_scenario_6_trickle_wins_when_others_disabled() -> None:
         ev=_ev(on=False, amps=0),
         pv_forecasts=[],
     )
-    assert d2.target_amps == 8
-    assert d2.on is True
-    assert "trickle" in d2.reason
-
-
-def test_scenario_6_trickle_applies_even_without_telemetry() -> None:
-    """Trickle.applies() is unconditional — fires before any telemetry."""
-    s = _settings(
-        surplus_enabled=False,
-        morning_dump_enabled=False,
-        trickle_enabled=True,
-        trickle_kw=2.0,
-    )
-    ctl = Controller(s)
-
-    # Very first tick, no PW3, no Emporia load, no EV state -> state has
-    # all-None fields. Trickle.applies returns True regardless.
-    t = datetime(2026, 5, 13, 3, 0, tzinfo=_TZ)
-    d = ctl.tick(
-        t,
-        pw=None,
-        em_load_w=None,
-        ev=None,
-        pv_forecasts=[],
-    )
-    assert d.on is True
-    assert d.target_amps == 8
-    assert "trickle" in d.reason
+    assert d2.target_amps == 0
+    assert d2.on is False
+    assert "no action applies" in d2.reason

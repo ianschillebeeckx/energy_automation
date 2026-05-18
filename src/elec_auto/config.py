@@ -47,12 +47,12 @@ class Settings(BaseSettings):
     ev_max_amps: int = Field(default=40, ge=6)
     ev_voltage: int = 240
 
-    # Per-action enable flags. Surplus and morning_dump are the two
-    # everyday actions; trickle is a manual top-up that defaults off.
-    # The dashboard's legacy mode buttons map to combinations of these.
+    # Per-action enable flags. The two actions are independently
+    # toggleable. Disabling automation entirely is the Controller's
+    # `kill_switch`, which is orthogonal to these flags; with the kill
+    # switch engaged neither action runs even if the flag is True.
     surplus_enabled: bool = True
     morning_dump_enabled: bool = True
-    trickle_enabled: bool = False
 
     # Powerwall usable capacity (kWh). One PW3 unit is 13.5 kWh; override
     # in .env if the site has more. Used by the morning-dump calculator.
