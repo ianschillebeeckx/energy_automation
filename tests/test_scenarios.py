@@ -125,6 +125,7 @@ def test_scenario_1_day_in_the_life() -> None:
     assert d1.on is True
     assert d1.target_amps == 20
     assert "surplus" in d1.reason
+    assert d1.action_name == "surplus"
 
     # Tick 2: 21:00 — sun's down, fresh telemetry says solar=0.
     # Surplus.applies fails (solar<=0), nothing else qualifies outside
@@ -140,6 +141,7 @@ def test_scenario_1_day_in_the_life() -> None:
     assert d2.on is False
     assert d2.target_amps == 0
     assert d2.reason == "no action applies"
+    assert d2.action_name == "none"
 
     # Tick 3: next-day 05:00 — dump window opens (5:00-8:00).
     day2 = day1 + timedelta(days=1)
@@ -300,6 +302,7 @@ def test_scenario_3_pw3_dark_mid_dump_continues() -> None:
     )
     assert d1.on is True
     assert d1.reason.startswith("dump")
+    assert d1.action_name == "morning_dump"
 
     # 05:30 — mid-window, fresh telemetry. SoC=65, battery discharging
     # at 1500 W. Dump still fires.
@@ -370,6 +373,7 @@ def test_scenario_4_kill_switch() -> None:
         pv_forecasts=[],
     )
     assert d1.reason == "kill switch engaged"
+    assert d1.action_name == "kill_switch"
     # Reflects the EVSE state observed this tick, not a freshly-computed plan.
     assert d1.target_amps == d0.target_amps
     assert d1.on is True
@@ -448,6 +452,7 @@ def test_scenario_5_morning_dump_disabled_does_not_let_surplus_run_in_window() -
         pv_forecasts=[],
     )
     assert d2.reason == "no action applies"
+    assert d2.action_name == "none"
     assert d2.on is False
     assert d2.target_amps == 0
 

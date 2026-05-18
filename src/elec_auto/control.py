@@ -30,6 +30,7 @@ reflecting the EVSE's last-known configured rate.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 
 from loguru import logger
@@ -115,6 +116,7 @@ class Controller:
                 self.state.ev_amps or 0,
                 "kill switch engaged",
                 on=self.state.ev_on or False,
+                action_name="kill_switch",
             )
 
         # 3. Build ActionContext for this tick.
@@ -137,7 +139,7 @@ class Controller:
             and a.applies(self.state, ctx)
         ]
         if not candidates:
-            return Decision(0, "no action applies", on=False)
+            return Decision(0, "no action applies", on=False, action_name="none")
 
         # 5. Highest priority wins. Ties at the top are a design smell
         # (actions are supposed to partition by predicate) — warn but
@@ -152,4 +154,8 @@ class Controller:
                 tied,
             )
         winner = candidates[0]
-        return winner.decide(self.state, ctx)
+        decision = winner.decide(self.state, ctx)
+        # Stamp the action's name so downstream (logging, sample
+        # recording, dashboard) can identify what fired without
+        # sniffing the reason string.
+        return replace(decision, action_name=winner.name)

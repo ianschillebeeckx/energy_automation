@@ -38,6 +38,10 @@ class Decision:
     # configured at (e.g. the preview for a scheduled mode), so the dashboard
     # shows something meaningful while the breaker is paused.
     on: bool = False
+    # Which action produced this Decision. Filled by `Controller.tick()`
+    # from the winning action's `name`. "" for kill-switch / "no action
+    # applies" / direct policy.decide_ev_amps() callers.
+    action_name: str = ""
 
 
 def decide_ev_amps(
