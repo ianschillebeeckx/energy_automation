@@ -90,6 +90,13 @@ class State:
     ev_on: bool | None = None
     ev_status: str | None = None      # "Charging" / "Standby" / "Disconnected"
 
+    # Measured EV-circuit watts from Emporia. Distinct from ev_amps: when
+    # the EVSE is configured ON at 40 A but the car isn't drawing (Standby /
+    # Disconnected), the proxy ev_amps × voltage is a phantom; this field
+    # carries reality. Snapped from the per-tick circuits dict, held across
+    # ticks where Emporia is dark (same pattern as em_load_w).
+    ev_circuit_w: float | None = None
+
     # Per-source last-fresh-read anchors (unix seconds). Distinct from
     # `ts` so a stale reading can't masquerade as fresh.
     pw_last_ts: float | None = None
@@ -112,6 +119,7 @@ def step(
     ev: ChargerState | None,
     settings: Settings,
     solar_forecast_w: float | None = None,
+    ev_circuit_w: float | None = None,
 ) -> State:
     """Advance `state` to `now`, incorporating this tick's measurements.
 
@@ -212,6 +220,13 @@ def step(
         em_load = state.em_load_w
         em_last_ts = state.em_last_ts
 
+    # Measured EV-circuit watts. Same source as em_load_w (Emporia); snap
+    # when present, hold last-known otherwise.
+    if ev_circuit_w is not None:
+        ev_circ_w = ev_circuit_w
+    else:
+        ev_circ_w = state.ev_circuit_w
+
     # EVSE.
     if ev is not None:
         ev_amps: int | None = ev.charge_rate_a
@@ -236,6 +251,7 @@ def step(
         solar_w=solar_w, battery_w=battery_w, grid_w=grid_w,
         pw_load_w=pw_load_w, em_load_w=em_load, load_w=load_w,
         ev_amps=ev_amps, ev_on=ev_on, ev_status=ev_status,
+        ev_circuit_w=ev_circ_w,
         pw_last_ts=pw_last_ts, em_last_ts=em_last_ts, ev_last_ts=ev_last_ts,
         soc_source=soc_source, load_source=load_source,
     )

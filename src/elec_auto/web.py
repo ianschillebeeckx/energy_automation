@@ -302,12 +302,13 @@ def _control_tick() -> None:
     pv_forecasts = _forecast_store().operational_in_range(
         now_ts, now_ts + 24 * 3600,
     )
-    em_load_w = _em_main_load_w()
+    em_load_w, ev_circuit_w = _em_loads(ev.name if ev else "EV Charger")
     tz = ZoneInfo(settings.timezone)
     ctl = _ctl()
     decision = ctl.tick(
         datetime.now(tz),
         pw=pw, em_load_w=em_load_w, ev=ev,
+        ev_circuit_w=ev_circuit_w,
         pv_forecasts=pv_forecasts,
         sample_store=_sample_store(),
         load_store=_load_store(),
@@ -330,17 +331,21 @@ def _control_tick() -> None:
     _apply_target(decision)
 
 
-def _em_main_load_w() -> float | None:
-    """Production-side: pull the latest Emporia circuit dict and feed
-    it to the shared `em_panel_sum` so the replay tests can compute the
-    same scalar from the historical loads table."""
+def _em_loads(ev_circuit_name: str) -> tuple[float | None, float | None]:
+    """Pull one Emporia circuit snapshot and split it into:
+
+      - `em_load_w`   : whole-house load via `em_panel_sum` (toplines)
+      - `ev_circuit_w`: measured EV draw from the EVSE's own Vue device
+
+    Threshold is forced to 0 W so the EV channel is never dropped when
+    the car is in Standby (Surplus.decide needs the real value, not a
+    None that falls back to the phantom `ev_amps × voltage` proxy).
+    """
     try:
-        circuits = _emporia().all_circuit_loads(
-            min_threshold_w=settings.load_log_threshold_w,
-        )
+        circuits = _emporia().all_circuit_loads(min_threshold_w=0.0)
     except Exception:
-        return None
-    return em_panel_sum(circuits)
+        return None, None
+    return em_panel_sum(circuits), circuits.get(ev_circuit_name)
 
 
 # Channels we treat as roll-ups, not individual circuits. The per-circuit

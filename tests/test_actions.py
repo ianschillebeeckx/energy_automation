@@ -53,6 +53,7 @@ def _state(
     battery: float | None = 0.0,
     ev_amps: int | None = 0,
     ev_on: bool | None = False,
+    ev_circuit_w: float | None = None,
 ) -> State:
     return State(
         ts=_T0.timestamp(),
@@ -62,6 +63,7 @@ def _state(
         load_w=load,
         ev_amps=ev_amps,
         ev_on=ev_on,
+        ev_circuit_w=ev_circuit_w,
     )
 
 
@@ -183,6 +185,27 @@ def test_surplus_decide_backs_out_ev_own_draw() -> None:
     st = _state(soc=85, solar=5000, load=4000, ev_on=True, ev_amps=12)
     d = a.decide(st, _ctx())
     assert d.target_amps == 16
+    assert d.on is True
+
+
+def test_surplus_decide_uses_measured_ev_circuit_w_over_proxy() -> None:
+    """Regression for the 2026-05-18 phantom-draw bug: EV configured ON
+    at 40 A but Standby (car unplugged) → real draw ~0 W. The configured
+    proxy would say `ev_w_now = 40*240 = 9600 W`, making surplus look
+    9.6 kW larger than reality. With state.ev_circuit_w available the
+    action must use it instead, giving the actual surplus.
+    """
+    a = Surplus()
+    # Solar 3000 W, total house load 400 W, EVSE configured ON at 40 A
+    # but Emporia reports 14 W on the EV circuit (Standby idle draw).
+    # Real non-EV load = 400 - 14 = 386 W; real surplus = 2614 W → 10 A.
+    # Without the fix: ev_w_now=9600 → non_ev=-9200 → surplus=12200 → 40 A.
+    st = _state(
+        soc=85, solar=3000, load=400,
+        ev_on=True, ev_amps=40, ev_circuit_w=14.0,
+    )
+    d = a.decide(st, _ctx())
+    assert d.target_amps == 10
     assert d.on is True
 
 

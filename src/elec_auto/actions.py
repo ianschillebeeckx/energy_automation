@@ -102,13 +102,19 @@ class Surplus:
 
     def decide(self, state: State, ctx: ActionContext) -> Decision:
         s = ctx.settings
-        # Subtract the EV's own current draw so we don't think we have
-        # more surplus than we do. ev_on==True means the EVSE is enabled;
-        # we approximate actual draw as configured_rate × voltage when on.
-        ev_w_now = (
-            (state.ev_amps or 0) * s.ev_voltage
-            if state.ev_on else 0
-        )
+        # Subtract the EV's own draw so we don't think we have more
+        # surplus than we do. Prefer the measured Emporia EV-circuit
+        # reading — the proxy `ev_amps × voltage` is a phantom when the
+        # EVSE is configured ON but the car is Standby/Disconnected,
+        # which made the controller ratchet to the max amperage even
+        # with the car unplugged.
+        if state.ev_circuit_w is not None:
+            ev_w_now = state.ev_circuit_w
+        else:
+            ev_w_now = (
+                (state.ev_amps or 0) * s.ev_voltage
+                if state.ev_on else 0
+            )
         non_ev_load_w = (state.load_w or 0) - ev_w_now
         surplus_w = (state.solar_w or 0) - non_ev_load_w
 

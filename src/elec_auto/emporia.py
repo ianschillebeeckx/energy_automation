@@ -147,7 +147,7 @@ class Emporia:
                 else:
                     continue  # unnamed non-Main channel: skip
                 watts = float(ch.usage or 0.0) * _KWH_PER_MIN_TO_W
-                if watts > min_threshold_w:
+                if watts >= min_threshold_w:
                     out[label] = watts
         return out
 

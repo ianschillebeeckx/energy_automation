@@ -99,6 +99,7 @@ class Controller:
         sample_store: SampleStore | None = None,
         load_store: LoadStore | None = None,
         ev_circuit_name: str = "EV Charger",
+        ev_circuit_w: float | None = None,
     ) -> Decision:
         # 1. Advance state from this tick's measurements. Look up the
         # forecasted PV at `now` so step() can derive battery_w from
@@ -114,6 +115,7 @@ class Controller:
             em_load_w=em_load_w,
             solar_forecast_w=solar_forecast_w,
             ev=ev,
+            ev_circuit_w=ev_circuit_w,
             settings=self.settings,
         )
 
