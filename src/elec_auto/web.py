@@ -19,7 +19,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from loguru import logger
 
 from .config import settings
-from .controller import compute_target
+from .control import Controller
 from .emporia import ChargerState, Emporia
 from .flow import Flows, decompose
 from .timewindow import next_dump_window
@@ -41,8 +41,7 @@ from .solcast import Solcast, daily_schedule
 async def _lifespan(app_: FastAPI):
     loop = asyncio.get_running_loop()
     tasks = [loop.create_task(_control_loop())]
-    logger.info("control loop started (mode={}, interval={}s)",
-                _charge_mode, settings.poll_interval_sec)
+    logger.info("control loop started (interval={}s)", settings.poll_interval_sec)
     if settings.solcast_api_key and settings.solcast_resource_id:
         tasks.append(loop.create_task(_forecast_loop()))
         logger.info("solcast forecast loop started")
@@ -70,6 +69,15 @@ _forecasts: ForecastStore | None = None
 _loads: LoadStore | None = None
 _weather: WeatherStore | None = None
 _observations: ObservationStore | None = None
+_controller: Controller | None = None
+
+
+def _ctl() -> Controller:
+    """The module-level Controller singleton. Built on first access."""
+    global _controller
+    if _controller is None:
+        _controller = Controller(settings)
+    return _controller
 
 
 def _db_path():
@@ -111,18 +119,24 @@ def _observation_store() -> ObservationStore:
         _observations = ObservationStore(_db_path())
     return _observations
 
-_CHARGE_MODES: dict[str, str] = {
-    "surplus":      "Surplus solar",
-    "morning_dump": "Morning dump",
-    "trickle":      f"Trickle ({settings.trickle_kw:.0f} kW)",
-    "manual":       "Manual",
-    "off":          "Off",
-}
-_charge_mode: str = "surplus"
-# Tracks whether morning_dump has been actively pushing this window. Used to
-# trigger an auto-flip to "surplus" once the dump completes (floor reached
-# or window closed after activity).
-_dump_was_active: bool = False
+def _mode_label(ctl: Controller) -> str:
+    """Human-readable summary of the controller's current state.
+
+    Returned to the dashboard heading. Maps the action_name on the last
+    Decision (or the kill-switch state) onto a friendly label.
+    """
+    if ctl.kill_switch:
+        return "Disabled"
+    d = ctl.last_decision
+    if d is None:
+        return "Starting…"
+    if d.action_name == "surplus":
+        return "Surplus solar"
+    if d.action_name == "morning_dump":
+        return "Morning dump"
+    if d.action_name == "kill_switch":
+        return "Disabled"
+    return "Idle"
 
 
 def _powerwall() -> Powerwall:
@@ -249,84 +263,57 @@ def _apply_target(decision: Decision) -> None:
         logger.exception("apply: emporia init failed")
         return
     try:
+        action = decision.action_name or "—"
         if decision.on:
             em.set_amps(decision.target_amps, on=True)
-            logger.info("apply: mode={} set {} A on ({})",
-                        _charge_mode, decision.target_amps, decision.reason)
+            logger.info("apply: action={} set {} A on ({})",
+                        action, decision.target_amps, decision.reason)
         elif decision.target_amps >= settings.ev_min_amps:
             em.set_amps(decision.target_amps, on=False)
-            logger.info("apply: mode={} set {} A off ({})",
-                        _charge_mode, decision.target_amps, decision.reason)
+            logger.info("apply: action={} set {} A off ({})",
+                        action, decision.target_amps, decision.reason)
         else:
             em.set_on(False)
-            logger.info("apply: mode={} off ({})", _charge_mode, decision.reason)
+            logger.info("apply: action={} off ({})", action, decision.reason)
     except Exception:
         logger.exception("apply: push to EVSE failed")
 
 
 def _control_tick() -> None:
-    global _charge_mode, _dump_was_active
-    if _charge_mode == "manual":
-        return  # hands off: leave the EVSE entirely under manual control
+    """One tick of the control loop.
+
+    The Controller owns state and action selection. We:
+      1. Read raw telemetry (best-effort; None on failure).
+      2. Hand it to Controller.tick(), which updates state and returns
+         the Decision for this tick.
+      3. Persist a Sample row, EV-circuit row, and apply the Decision
+         to the EVSE unless we're missing the EV side.
+
+    No mode globals, no string-sniffing auto-flips — actions partition
+    by predicate inside the Controller.
+    """
+    from zoneinfo import ZoneInfo
+
     pw, _ = _safe_pw()
     ev, _ = _safe_em()
-    # Operational PV forecasts + integrated non-EV load (from yesterday's
-    # measured PW3 load minus measured EV circuit draw, sliced to the
-    # upcoming dump window). Only morning_dump uses these, but the
-    # lookups are cheap and passing them unconditionally keeps the
-    # controller signature uniform.
+
     now_ts = int(time.time())
     pv_forecasts = _forecast_store().operational_in_range(
         now_ts, now_ts + 24 * 3600,
     )
-    from zoneinfo import ZoneInfo
+    em_load_w = _em_main_load_w()
     tz = ZoneInfo(settings.timezone)
-    dump_start, dump_end = next_dump_window(datetime.now(tz), settings)
-    window_lo = max(now_ts, int(dump_start.timestamp()))
-    window_hi = int(dump_end.timestamp())
-    non_ev_load_forecast = _non_ev_load_kwh(
-        _sample_store(), _load_store(), window_lo, window_hi,
+    ctl = _ctl()
+    decision = ctl.tick(
+        datetime.now(tz),
+        pw=pw, em_load_w=em_load_w, ev=ev,
+        pv_forecasts=pv_forecasts,
+        sample_store=_sample_store(),
+        load_store=_load_store(),
         ev_circuit_name=(ev.name if ev else "EV Charger"),
     )
-    decision = compute_target(
-        _charge_mode, pw, ev, settings,
-        pv_forecasts=pv_forecasts,
-        non_ev_load_forecast=non_ev_load_forecast,
-    )
 
-    # Auto-switch morning_dump -> surplus when the dump is done, so the
-    # car keeps catching daytime surplus once the battery is drained.
-    if _charge_mode == "morning_dump":
-        # "scheduled" reasons mean we're outside the window (queued for
-        # later); anything else (dump / hold / at-floor) means we're
-        # inside it. Stripping the optional "sunny: " prefix keeps the
-        # check resilient to the sunny-day deep-dump flag.
-        bare_reason = decision.reason.removeprefix("sunny: ")
-        in_window = not bare_reason.startswith("scheduled ")
-        floor_reached = "at/below floor" in decision.reason
-        if in_window:
-            _dump_was_active = True
-        if floor_reached or (not in_window and _dump_was_active):
-            logger.info("morning_dump complete ({}) -> surplus", decision.reason)
-            _charge_mode = "surplus"
-            _dump_was_active = False
-            decision = compute_target(
-                _charge_mode, pw, ev, settings,
-                pv_forecasts=pv_forecasts,
-                non_ev_load_forecast=non_ev_load_forecast,
-            )
-
-    # Auto-switch surplus -> morning_dump once we cross today's astronomical
-    # sunset, queueing the next morning's scheduled charge.
-    if _charge_mode == "surplus" and _is_past_sunset():
-        logger.info("past sunset -> morning_dump")
-        _charge_mode = "morning_dump"
-        _dump_was_active = False
-        decision = compute_target(
-            _charge_mode, pw, ev, settings, pv_forecasts=pv_forecasts,
-        )
-
-    _record_sample(pw, ev, _charge_mode, decision)
+    _record_sample_from_state(ctl, decision)
     _record_loads(int(time.time()))
 
     if ev is None:
@@ -340,6 +327,25 @@ def _control_tick() -> None:
         if not ev.on and (not has_rate or ev.charge_rate_a == decision.target_amps):
             return
     _apply_target(decision)
+
+
+def _em_main_load_w() -> float | None:
+    """Best-effort: sum of all monitored Emporia circuits as a load
+    surrogate. Returns None on read failure so State.update treats it as
+    dark. Excludes the EV Charger circuit so the sum represents
+    *non-EV* household load (which the PW3 sees in its total too)."""
+    try:
+        circuits = _emporia().all_circuit_loads(
+            min_threshold_w=settings.load_log_threshold_w,
+        )
+    except Exception:
+        return None
+    if not circuits:
+        return None
+    return sum(
+        w for name, w in circuits.items()
+        if name not in {"Main", "Balance", "Garage Subpanel"}
+    )
 
 
 # Channels we treat as roll-ups, not individual circuits. The per-circuit
@@ -902,38 +908,42 @@ def _record_loads(ts: int) -> None:
         logger.warning("loads insert failed", exc_info=False)
 
 
-def _record_sample(
-    pw: PowerReading | None,
-    ev: ChargerState | None,
-    mode: str,
-    decision: Decision,
-) -> None:
-    """Persist a telemetry sample for the chart and analytics queries."""
-    import time as _time
+def _record_sample_from_state(ctl: Controller, decision: Decision) -> None:
+    """Persist a telemetry row built from the Controller's current state.
+
+    Reads exclusively from `ctl.state` (the post-step() snapshot) rather
+    than the raw pw/ev telemetry, so dead-reckoned SoC values during
+    brief PW3 outages still get persisted (instead of writing NULL).
+    The Decision's action_name and reason go into their respective
+    columns for log-free auditability.
+    """
     from zoneinfo import ZoneInfo
 
+    s = ctl.state
     now_local = datetime.now(ZoneInfo(settings.timezone))
     try:
         theoretical = theoretical_w(now_local, settings)
     except Exception:
         theoretical = None
-    soc = pw.battery_soc_pct if pw else None
+    soc = s.soc_pct
     if soc is not None and math.isnan(soc):
         soc = None
     sample = Sample(
-        ts=int(_time.time()),
-        solar_w=pw.solar_w if pw else None,
-        load_w=pw.load_w if pw else None,
-        battery_w=pw.battery_w if pw else None,
-        grid_w=pw.grid_w if pw else None,
+        ts=int(s.ts),
+        solar_w=s.solar_w,
+        load_w=s.load_w,
+        battery_w=s.battery_w,
+        grid_w=s.grid_w,
         soc_pct=soc,
         theoretical_w=theoretical,
-        charger_amps=ev.charge_rate_a if ev else None,
-        charger_on=ev.on if ev else None,
-        charger_status=ev.status if ev else None,
-        pw_ok=pw is not None,
-        em_ok=ev is not None,
-        mode=mode,
+        charger_amps=s.ev_amps,
+        charger_on=s.ev_on,
+        charger_status=s.ev_status,
+        pw_ok=s.soc_source == "pw3",
+        em_ok=s.em_last_ts is not None,
+        # Legacy column kept populated for charts that group by it.
+        mode=("disabled" if ctl.kill_switch else (decision.action_name or "idle")),
+        action_name=decision.action_name or None,
         decision_amps=decision.target_amps,
         decision_on=decision.on,
         decision_reason=decision.reason,
@@ -1102,46 +1112,40 @@ def _loads_foreign(consumers: list[tuple[str, float]] | None) -> str:
 
 
 def _modes_foreign(pw: PowerReading | None, ev: ChargerState | None) -> str:
-    # Two pairs of buttons sit side-by-side at the bottom of the panel so
-    # the column doesn't have to widen. Anything in `_PAIRED_KEYS` collapses
-    # into a flex row.
-    paired = {"off", "manual"}
+    """Dashboard control panel: enable/disable the automation.
 
-    def _hint_for(key: str) -> str:
-        if key == "trickle":
-            d = compute_target(key, pw, None, settings)
-            return f'<small>&rarr; {d.target_amps} A</small>'
-        if key == "surplus":
-            d = compute_target(key, pw, ev, settings)
-            return (f'<small>&rarr; {d.target_amps} A</small>'
-                    if d.target_amps else f'<small>{html.escape(d.reason)}</small>')
-        if key == "morning_dump":
-            preview_now = _next_dump_start(settings)
-            d = compute_target(key, pw, None, settings, now=preview_now)
-            return (f'<small>{preview_now:%H:%M} &rarr; {d.target_amps} A</small>'
-                    if d.target_amps else f'<small>{html.escape(d.reason)}</small>')
-        return ""
+    The legacy 5-button mode picker (surplus / morning_dump / trickle /
+    manual / off) collapsed into two buttons: "Enabled" and "Disabled".
+    Per-action enable flags live in Settings; the kill switch is the
+    user-facing "shut everything off" interrupt. EVSE amperage during
+    disable is set from the Emporia app directly.
+    """
+    ctl = _ctl()
+    active = "off" if ctl.kill_switch else "on"
 
-    def _btn(key: str, label: str) -> str:
-        cls = "mode-btn active" if key == _charge_mode else "mode-btn"
+    def _btn(value: str, label: str, sub: str) -> str:
+        cls = "mode-btn active" if value == active else "mode-btn"
         return (
-            f'<button type="submit" name="mode" value="{key}" class="{cls}">'
-            f'{label}{_hint_for(key)}</button>'
+            f'<button type="submit" name="state" value="{value}" class="{cls}">'
+            f'{label}<small>{sub}</small></button>'
         )
 
-    rows: list[str] = []
-    pair_buf: list[str] = []
-    for key, label in _CHARGE_MODES.items():
-        if key in paired:
-            pair_buf.append(_btn(key, label))
-        else:
-            rows.append(_btn(key, label))
-    if pair_buf:
-        rows.append(f'<div class="mode-row">{"".join(pair_buf)}</div>')
+    last = ctl.last_decision
+    on_sub = (
+        f'{_mode_label(ctl).lower()} &middot; {last.target_amps} A'
+        if (last and last.action_name not in ("kill_switch", "", "none"))
+        else _mode_label(ctl).lower()
+    )
+    off_sub = "EVSE under your manual control"
+
+    rows = [
+        _btn("on", "Enabled", on_sub),
+        _btn("off", "Disabled", off_sub),
+    ]
     x, y, w, h = _MODES_PANEL
     return (
         f'<foreignObject x="{x}" y="{y}" width="{w}" height="{h}">'
-        f'<div {_FO_NS} class="panel"><h3>Charge mode</h3>'
+        f'<div {_FO_NS} class="panel"><h3>Automation</h3>'
         f'<form method="post" action="/mode">' + "".join(rows) +
         '</form></div></foreignObject>'
     )
@@ -1407,11 +1411,13 @@ def _render(flash: str = "", flash_ok: bool = True, demo: str = "") -> str:
         pw, pw_err = _safe_pw()
         ev, ev_err = _safe_em()
         consumers = _safe_top_consumers()
-    try:
-        decision = compute_target(_charge_mode, pw, ev, settings)
-    except Exception as e:
-        logger.exception("compute_target failed")
-        decision = Decision(0, f"policy error: {e}")
+    # Use the Controller's most recent decision rather than re-running it
+    # synchronously per page render. If we don't have one yet (first
+    # request before the control loop has ticked), fall back to a
+    # placeholder so the dashboard still draws.
+    decision = _ctl().last_decision or Decision(
+        0, "waiting on first tick", on=False, action_name="none",
+    )
 
     def fmt_w(v: float) -> str:
         return f"{v:+.0f} W" if v else "0 W"
@@ -1442,7 +1448,7 @@ def _render(flash: str = "", flash_ok: bool = True, demo: str = "") -> str:
         ev_rows = f"<tr><td colspan=2 class=err>Emporia unavailable: {html.escape(ev_err or '')}</td></tr>"
 
     decision_html = (
-        f'<p class=decision><b>{html.escape(_CHARGE_MODES[_charge_mode])}:</b> '
+        f'<p class=decision><b>{html.escape(_mode_label(_ctl()))}:</b> '
         f'{decision.target_amps} A <small>({html.escape(decision.reason)})</small></p>'
     )
 
@@ -1540,16 +1546,20 @@ def index(demo: str = "") -> str:
 
 
 @app.post("/mode")
-def set_mode(mode: Annotated[str, Form()]) -> RedirectResponse:
-    global _charge_mode, _dump_was_active
-    if mode in _CHARGE_MODES:
-        _charge_mode = mode
-        _dump_was_active = False
-        logger.info("charge mode -> {}", mode)
-        if mode != "manual":
-            pw, _ = _safe_pw()
-            ev, _ = _safe_em()
-            _apply_target(compute_target(mode, pw, ev, settings))
+def set_mode(state: Annotated[str, Form()]) -> RedirectResponse:
+    """Enable or disable automation.
+
+    `state` is "on" (release kill switch) or "off" (engage it). The
+    next `_control_tick` picks up the change naturally — no need to
+    push anything to the EVSE here.
+    """
+    ctl = _ctl()
+    if state == "off":
+        ctl.engage_kill_switch()
+        logger.info("automation disabled by user (kill switch engaged)")
+    elif state == "on":
+        ctl.release_kill_switch()
+        logger.info("automation enabled by user (kill switch released)")
     return RedirectResponse("/", status_code=303)
 
 

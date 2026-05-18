@@ -63,6 +63,7 @@ class Controller:
     settings: Settings
     actions: list[Action]
     kill_switch: bool
+    last_decision: Decision | None
 
     def __init__(
         self,
@@ -73,6 +74,7 @@ class Controller:
         self.actions = actions if actions is not None else list(DEFAULT_ACTIONS)
         self.state = State()
         self.kill_switch = False
+        self.last_decision = None
 
     # --- kill-switch -------------------------------------------------------
 
@@ -108,9 +110,22 @@ class Controller:
             settings=self.settings,
         )
 
-        # 2. Kill-switch short-circuit. Telemetry was recorded above; we
-        # just refuse to act. Return a no-op decision so callers can
-        # still render the EVSE's current configured rate.
+        decision = self._decide(now, pv_forecasts, sample_store, load_store,
+                                 ev_circuit_name)
+        self.last_decision = decision
+        return decision
+
+    def _decide(
+        self,
+        now: datetime,
+        pv_forecasts: list[Forecast],
+        sample_store: SampleStore | None,
+        load_store: LoadStore | None,
+        ev_circuit_name: str,
+    ) -> Decision:
+        # Kill-switch short-circuit. Telemetry already updated; we just
+        # refuse to act. Reflect the EVSE's current configured rate so
+        # the dashboard renders something meaningful.
         if self.kill_switch:
             return Decision(
                 self.state.ev_amps or 0,
@@ -119,7 +134,6 @@ class Controller:
                 action_name="kill_switch",
             )
 
-        # 3. Build ActionContext for this tick.
         dump_start, dump_end = next_dump_window(now, self.settings)
         ctx = ActionContext(
             now=now,
@@ -132,7 +146,6 @@ class Controller:
             ev_circuit_name=ev_circuit_name,
         )
 
-        # 4. Filter to enabled + applicable actions.
         candidates = [
             a for a in self.actions
             if getattr(self.settings, a.enabled_setting, True)
@@ -141,7 +154,7 @@ class Controller:
         if not candidates:
             return Decision(0, "no action applies", on=False, action_name="none")
 
-        # 5. Highest priority wins. Ties at the top are a design smell
+        # Highest priority wins. Ties at the top are a design smell
         # (actions are supposed to partition by predicate) — warn but
         # still pick deterministically by the actions' list order
         # (Python's sort is stable, so the first registered wins).
