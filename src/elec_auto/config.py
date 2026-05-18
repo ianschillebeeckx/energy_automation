@@ -38,6 +38,10 @@ class Settings(BaseSettings):
 
     # Control loop
     poll_interval_sec: int = 30
+    # How long a telemetry reading stays "fresh" for ControlState's
+    # load_w preference logic. A PW3 reading older than this falls back
+    # to an Emporia reading if Emporia is fresher (and vice versa).
+    telemetry_fresh_sec: int = Field(default=60, ge=10, le=600)
     battery_reserve_pct: int = Field(default=80, ge=0, le=100)
     ev_min_amps: int = Field(default=6, ge=6)
     ev_max_amps: int = Field(default=40, ge=6)
