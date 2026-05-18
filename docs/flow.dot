@@ -1,0 +1,29 @@
+// Power flow decomposition from src/elec_auto/flow.py
+// Nodes: the four scalars on the meter.
+// Edges: the seven directed flows in Flows, labeled by priority order
+// in decompose() (1 = first to be allocated).
+digraph PowerFlow {
+    rankdir=LR;
+    node [shape=box, style="rounded,filled", fontname="Helvetica"];
+    edge [fontname="Helvetica", fontsize=10];
+
+    solar   [fillcolor="#FFE082", label="solar"];
+    battery [fillcolor="#A5D6A7", label="battery"];
+    grid    [fillcolor="#90CAF9", label="grid"];
+    home    [fillcolor="#EF9A9A", label="home"];
+
+    // Home-serving priority: solar -> battery -> grid
+    solar   -> home    [label="1. solar_to_home",    color="#F57F17"];
+    battery -> home    [label="2. battery_to_home",  color="#2E7D32"];
+    grid    -> home    [label="3. grid_to_home",     color="#1565C0"];
+
+    // Surplus solar: charge battery, then export
+    solar   -> battery [label="4. solar_to_battery", color="#F57F17"];
+    solar   -> grid    [label="5. solar_to_grid",    color="#F57F17"];
+
+    // Battery export (when battery discharge exceeds home demand)
+    battery -> grid    [label="6. battery_to_grid",  color="#2E7D32"];
+
+    // Grid-charging (e.g. Storm Watch); balances totals, not drawn in dashboard
+    grid    -> battery [label="7. grid_to_battery",  color="#1565C0", style=dashed];
+}

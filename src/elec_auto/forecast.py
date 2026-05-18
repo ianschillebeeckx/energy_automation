@@ -127,6 +127,25 @@ def _interp(points: list[tuple[int, float]], ts: int, default: float = 0.0) -> f
     return v0 + (v1 - v0) * frac
 
 
+def pv_w_at(pv_forecasts: list[Forecast], ts: int) -> float | None:
+    """Linear-interpolated p50 PV watts at `ts` (unix seconds).
+
+    Returns None when no forecast covers `ts` — used by state.step() as
+    a fallback solar reading when PW3 is dark, so that SoC dead-reckoning
+    can derive battery_w from the Tesla power balance instead of
+    blindly extrapolating from a stale held rate.
+    """
+    if not pv_forecasts:
+        return None
+    pts = sorted(
+        (f.period_ts, f.pv_w_p50)
+        for f in pv_forecasts if f.pv_w_p50 is not None
+    )
+    if not pts or ts < pts[0][0] or ts > pts[-1][0]:
+        return None
+    return _interp(pts, ts, default=0.0)
+
+
 def pv_kwh_in_range(
     pv_forecasts: list[Forecast], start_ts: int, end_ts: int,
 ) -> float:

@@ -67,6 +67,14 @@ class Settings(BaseSettings):
     #     displayed = max(0, (raw - floor) / (100 - floor) * 100)
     # If Tesla ever changes this on PW3 firmware, adjust here.
     battery_raw_floor_pct: float = Field(default=5.0, ge=5.0, le=20.0)
+    # Continuous DC draw from the cells for gateway, BMS, thermal
+    # management, and cell balancing. Never crosses the inverter so it
+    # doesn't appear in AC `battery_w` — but it drains real SoC. Used
+    # by `state.step()`'s dead-reckoning branch as a constant added to
+    # the AC-balance battery_w_est. Fit empirically on 2026-05-18:
+    # AC integration of recorded battery_w underpredicted SoC drop by
+    # ~66 W average over a 2-hour outage window.
+    battery_vampire_w: float = Field(default=66.0, ge=0.0, le=500.0)
     # Morning-dump window: starts at `start_hour` and runs for `hours`.
     # Default 06:00 + 2 h spreads the dump across two hours so the per-tick
     # amperage is roughly halved vs a 1 h window — gentler on the EVSE,

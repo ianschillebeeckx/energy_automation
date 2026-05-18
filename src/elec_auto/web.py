@@ -27,6 +27,7 @@ from .forecast import load_forecast as _load_forecast
 from .forecast import non_ev_load_kwh_in_window as _non_ev_load_kwh
 from .forecast import soc_forecast as _soc_forecast
 from .nws import NWS
+from .state import em_panel_sum
 from .policy import Decision
 from .powerwall import Powerwall, PowerReading
 from .samples import (
@@ -330,22 +331,16 @@ def _control_tick() -> None:
 
 
 def _em_main_load_w() -> float | None:
-    """Best-effort: sum of all monitored Emporia circuits as a load
-    surrogate. Returns None on read failure so State.update treats it as
-    dark. Excludes the EV Charger circuit so the sum represents
-    *non-EV* household load (which the PW3 sees in its total too)."""
+    """Production-side: pull the latest Emporia circuit dict and feed
+    it to the shared `em_panel_sum` so the replay tests can compute the
+    same scalar from the historical loads table."""
     try:
         circuits = _emporia().all_circuit_loads(
             min_threshold_w=settings.load_log_threshold_w,
         )
     except Exception:
         return None
-    if not circuits:
-        return None
-    return sum(
-        w for name, w in circuits.items()
-        if name not in {"Main", "Balance", "Garage Subpanel"}
-    )
+    return em_panel_sum(circuits)
 
 
 # Channels we treat as roll-ups, not individual circuits. The per-circuit

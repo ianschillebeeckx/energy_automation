@@ -13,6 +13,10 @@ def _settings(**overrides) -> Settings:
         battery_capacity_kwh=13.5,
         battery_raw_floor_pct=5.0,
         telemetry_fresh_sec=60,
+        # Disabled here so these unit tests exercise the energy-balance
+        # math in isolation. The empirically-fit production default is
+        # validated by tests/test_replay.py against recorded telemetry.
+        battery_vampire_w=0.0,
     )
     defaults.update(overrides)
     return Settings(_env_file=None, **defaults)  # type: ignore[arg-type]
@@ -113,9 +117,11 @@ def test_soc_snaps_to_fresh_pw_even_with_held_battery_w() -> None:
 
 
 def test_soc_dead_reckons_when_pw_dark() -> None:
-    # 1 h discharging at 1 kW. usable = 13.5 * 0.95 = 12.825 kWh.
-    # delta = -1 / 12.825 * 100 ≈ -7.8 percentage points.
-    s1 = step(State(), _TZ_NOON, pw=_pw(soc=80, battery=1000),
+    # 1 h with battery sustaining a 1 kW load (no solar, no grid),
+    # so the Tesla balance gives battery_w = 1000 W discharging.
+    # delta = -1 kWh / 12.825 kWh × 100 ≈ -7.8 percentage points.
+    s1 = step(State(), _TZ_NOON,
+              pw=_pw(soc=80, battery=1000, load=1000, solar=0, grid=0),
               em_load_w=None, ev=None, settings=_settings())
     s2 = step(s1, _TZ_NOON + 3600, pw=None, em_load_w=None, ev=None,
               settings=_settings())
@@ -123,8 +129,10 @@ def test_soc_dead_reckons_when_pw_dark() -> None:
 
 
 def test_soc_dead_reckons_up_when_charging() -> None:
-    # battery_w < 0 = charging, SoC rises.
-    s1 = step(State(), _TZ_NOON, pw=_pw(soc=40, battery=-2000),
+    # battery_w < 0 = charging, SoC rises. 2 kW of surplus PV charges
+    # the battery: solar = 2 kW, load = 0, grid = 0 → battery = -2 kW.
+    s1 = step(State(), _TZ_NOON,
+              pw=_pw(soc=40, battery=-2000, solar=2000, load=0, grid=0),
               em_load_w=None, ev=None, settings=_settings())
     s2 = step(s1, _TZ_NOON + 3600, pw=None, em_load_w=None, ev=None,
               settings=_settings())
@@ -132,7 +140,9 @@ def test_soc_dead_reckons_up_when_charging() -> None:
 
 
 def test_soc_clamps_at_100() -> None:
-    s1 = step(State(), _TZ_NOON, pw=_pw(soc=98, battery=-5000),
+    # Heavy charging, starting SoC 98% — should saturate at 100.
+    s1 = step(State(), _TZ_NOON,
+              pw=_pw(soc=98, battery=-5000, solar=5000, load=0, grid=0),
               em_load_w=None, ev=None, settings=_settings())
     s2 = step(s1, _TZ_NOON + 3600, pw=None, em_load_w=None, ev=None,
               settings=_settings())
@@ -140,7 +150,8 @@ def test_soc_clamps_at_100() -> None:
 
 
 def test_soc_clamps_at_0() -> None:
-    s1 = step(State(), _TZ_NOON, pw=_pw(soc=2, battery=5000),
+    s1 = step(State(), _TZ_NOON,
+              pw=_pw(soc=2, battery=5000, load=5000, solar=0, grid=0),
               em_load_w=None, ev=None, settings=_settings())
     s2 = step(s1, _TZ_NOON + 3600, pw=None, em_load_w=None, ev=None,
               settings=_settings())

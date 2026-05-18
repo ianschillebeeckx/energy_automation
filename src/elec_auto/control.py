@@ -100,12 +100,19 @@ class Controller:
         load_store: LoadStore | None = None,
         ev_circuit_name: str = "EV Charger",
     ) -> Decision:
-        # 1. Advance state from this tick's measurements.
+        # 1. Advance state from this tick's measurements. Look up the
+        # forecasted PV at `now` so step() can derive battery_w from
+        # the power balance when PW3 is dark — letting Emporia load
+        # spikes and forecast solar inform the dead-reckoning instead
+        # of blindly extrapolating from the held PW3 rate.
+        from .forecast import pv_w_at
+        solar_forecast_w = pv_w_at(pv_forecasts, int(now.timestamp()))
         self.state = step(
             self.state,
             now.timestamp(),
             pw=pw,
             em_load_w=em_load_w,
+            solar_forecast_w=solar_forecast_w,
             ev=ev,
             settings=self.settings,
         )

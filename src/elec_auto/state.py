@@ -29,6 +29,36 @@ from .config import Settings
 from .emporia import ChargerState
 from .powerwall import PowerReading
 
+# Emporia circuit labels we treat as device toplines — the "Main"
+# channel of one Emporia Vue, which measures the total current flowing
+# through that device's CTs. Named individual circuits (Fridge, Oven,
+# Lights, ...) are children of one of these toplines, so summing
+# toplines gives whole-house load without double-counting children.
+#
+# Specific to this home: the panel-monitor device is named "Garage
+# Subpanel" (so its Main channel comes through under that label, not
+# the literal "Main") and the EVSE is its own Vue device whose Main
+# comes through as "EV Charger".
+TOPLINE_CIRCUITS = frozenset({"Garage Subpanel", "EV Charger"})
+
+
+def em_panel_sum(circuits: dict[str, float] | None) -> float | None:
+    """Whole-house load estimate from an Emporia reading.
+
+    Sums the device-topline channels (see `TOPLINE_CIRCUITS`) — not
+    the individual named circuits, because each named circuit is a
+    child of one of those toplines and would double-count.
+
+    Returns None when the reading is missing or contains no toplines
+    this tick, matching `step()`'s `em_load_w=None` semantics so the
+    SoC dead-reckoning falls back rather than treating "we measured
+    nothing" as "load = 0 W".
+    """
+    if not circuits:
+        return None
+    toplines = [w for name, w in circuits.items() if name in TOPLINE_CIRCUITS]
+    return sum(toplines) if toplines else None
+
 
 @dataclass(frozen=True, slots=True)
 class State:
@@ -81,6 +111,7 @@ def step(
     em_load_w: float | None,
     ev: ChargerState | None,
     settings: Settings,
+    solar_forecast_w: float | None = None,
 ) -> State:
     """Advance `state` to `now`, incorporating this tick's measurements.
 
@@ -90,33 +121,71 @@ def step(
     Per-field behavior:
 
       `soc_pct`              snap to `pw.battery_soc_pct` if fresh;
-                             else dead-reckon from held `battery_w` over
-                             `dt = now - state.ts`, clamped to [0, 100].
+                             else dead-reckon using a battery_w derived
+                             from the Tesla power balance:
+
+                               battery_w = load_w − solar_w − grid_w
+
+                             with each term picked from the freshest
+                             source available this tick (see below).
       `solar_w` / `battery_w` / `grid_w` / `pw_load_w`
                              snap from `pw` if fresh; else hold.
       `em_load_w`            snap if fresh; else hold.
       `ev_*`                 snap from `ev` if fresh; else hold.
       `load_w`               derived: best of fresh-pw > fresh-em >
                              stale-pw > stale-em.
+
+    Source preference for the SoC dead-reckoning's energy balance:
+      load_w  : em_load_w (fresh) > state.pw_load_w (held) > None
+      solar_w : solar_forecast_w  > state.solar_w  (held) > None
+      grid_w  : state.grid_w (held) (no fallback — usually small and
+                we have no surrogate)
+    If any of those are None, we fall back to pure held-battery_w
+    extrapolation (the prior behavior) so callers without forecasts
+    still produce a value.
     """
     dt = max(0.0, now - state.ts)
     j_per_kwh = 3_600_000.0
 
-    # SoC: snap to fresh PW3 or dead-reckon from held battery_w.
+    # SoC: snap to fresh PW3 or dead-reckon from energy-balance battery_w.
     if pw is not None:
         soc_pct: float | None = pw.battery_soc_pct
         soc_source: str | None = "pw3"
-    elif state.soc_pct is not None and state.battery_w is not None:
-        usable_kwh = settings.battery_capacity_kwh * (
-            1.0 - settings.battery_raw_floor_pct / 100.0
+    elif state.soc_pct is not None:
+        # Pick the freshest available source for each balance term.
+        bal_load = (
+            em_load_w if em_load_w is not None
+            else state.pw_load_w
         )
-        if usable_kwh > 0:
-            # battery_w > 0 = discharging, so SoC drops; sign flip.
-            delta_pct = -state.battery_w * dt / j_per_kwh / usable_kwh * 100.0
-            soc_pct = max(0.0, min(100.0, state.soc_pct + delta_pct))
+        bal_solar = (
+            solar_forecast_w if solar_forecast_w is not None
+            else state.solar_w
+        )
+        bal_grid = state.grid_w
+        if bal_load is not None and bal_solar is not None and bal_grid is not None:
+            # Tesla balance: battery = load - solar - grid.
+            battery_w_est: float | None = bal_load - bal_solar - bal_grid
+        else:
+            battery_w_est = state.battery_w  # fall back to held
+        if battery_w_est is not None:
+            # Add the always-on DC draw inside the Powerwall (gateway,
+            # BMS, thermal mgmt). Never crosses the inverter so it's
+            # invisible in the AC balance, but it does drain SoC and
+            # shows up empirically as a ~50-80 W bias on AC-derived
+            # extrapolation across long outages.
+            battery_w_est += settings.battery_vampire_w
+            usable_kwh = settings.battery_capacity_kwh * (
+                1.0 - settings.battery_raw_floor_pct / 100.0
+            )
+            if usable_kwh > 0:
+                delta_pct = -battery_w_est * dt / j_per_kwh / usable_kwh * 100.0
+                soc_pct = max(0.0, min(100.0, state.soc_pct + delta_pct))
+            else:
+                soc_pct = state.soc_pct
+            soc_source = "estimated"
         else:
             soc_pct = state.soc_pct
-        soc_source = "estimated"
+            soc_source = state.soc_source
     else:
         soc_pct = state.soc_pct
         soc_source = state.soc_source
