@@ -19,12 +19,15 @@ def test_round_trip(tmp_path: Path) -> None:
     s.insert(Sample(
         ts=1000, solar_w=4200.0, load_w=900.0, battery_w=-500.0, grid_w=-2800.0,
         soc_pct=75.5, theoretical_w=5100.0,
-        charger_amps=20, charger_on=True,
+        charger_amps=20, charger_on=True, charger_status="Charging",
+        action_name="surplus",
     ))
     rows = s.read_range(0, 2000)
     assert len(rows) == 1
     assert rows[0].solar_w == 4200.0
     assert rows[0].charger_on is True
+    assert rows[0].charger_status == "Charging"
+    assert rows[0].action_name == "surplus"
 
 
 def test_missing_fields_stored_as_none(tmp_path: Path) -> None:
