@@ -155,11 +155,39 @@ def _safe_em() -> tuple[ChargerState | None, str | None]:
         return None, str(e)
 
 
+# Channels we never want to show in "Top loads": the synthetic Main /
+# Balance / sub-panel roll-ups (double-counting) and the EV Charger
+# (which already has its own dashboard node).
+_TOP_CONSUMERS_EXCLUDE = {
+    "Main", "Balance", "Garage Subpanel", "EV Charger", "EV", "Car", "Tesla",
+}
+
+
 def _safe_top_consumers(n: int = 3) -> list[tuple[str, float]] | None:
+    """Top-N non-aggregate circuits at the most recent recorded tick.
+
+    Reads from the `loads` table the control loop populates each tick —
+    avoids hitting Emporia synchronously from the request handler, which
+    can be slow when their cloud is sluggish.
+    """
     try:
-        return _emporia().top_consumers(n)
+        import time as _time
+        now = int(_time.time())
+        recent = _load_store().read_range(now - 120, now)
+        if not recent:
+            return None
+        latest_ts = max(r.ts for r in recent)
+        rows = [
+            (r.circuit, r.watts)
+            for r in recent
+            if r.ts == latest_ts
+            and r.circuit not in _TOP_CONSUMERS_EXCLUDE
+            and r.watts > 0
+        ]
+        rows.sort(key=lambda x: x[1], reverse=True)
+        return rows[:n]
     except Exception:
-        logger.exception("emporia top_consumers failed")
+        logger.exception("top_consumers from loads failed")
         return None
 
 
