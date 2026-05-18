@@ -17,6 +17,7 @@ from .forecast import pv_kwh_in_range
 from .policy import Decision, decide_ev_amps
 from .powerwall import PowerReading
 from .samples import Forecast
+from .timewindow import next_dump_window  # re-export for legacy callers
 
 
 def _sunny_floor_pct(
@@ -48,35 +49,6 @@ def _sunny_floor_pct(
     if forecast_kwh >= settings.morning_dump_sunny_threshold_kwh:
         return settings.morning_dump_sunny_floor_pct
     return settings.morning_dump_floor_pct
-
-
-def next_dump_window(now: datetime, settings: Settings) -> tuple[datetime, datetime]:
-    """Return the [start, end) window for the next upcoming morning-dump.
-
-    If today's window is still ahead or currently active, returns today's.
-    If today's window has already ended, returns tomorrow's. This lets the
-    user click the button in the evening and have the schedule fire at
-    the next morning's start time.
-
-    Start and end are both wall-clock anchored, so they roll together
-    across midnight if the user ever configures an overnight window.
-    """
-    start_today = now.replace(
-        hour=settings.morning_dump_start_hour,
-        minute=settings.morning_dump_start_minute,
-        second=0, microsecond=0,
-    )
-    end_today = now.replace(
-        hour=settings.morning_dump_end_hour,
-        minute=settings.morning_dump_end_minute,
-        second=0, microsecond=0,
-    )
-    if now < end_today:
-        return start_today, end_today
-    return (
-        start_today + timedelta(days=1),
-        end_today + timedelta(days=1),
-    )
 
 
 def compute_target(

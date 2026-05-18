@@ -22,7 +22,7 @@ from .config import settings
 from .controller import compute_target
 from .emporia import ChargerState, Emporia
 from .flow import Flows, decompose
-from .controller import next_dump_window
+from .timewindow import next_dump_window
 from .forecast import load_forecast as _load_forecast
 from .forecast import non_ev_load_kwh_in_window as _non_ev_load_kwh
 from .forecast import soc_forecast as _soc_forecast
