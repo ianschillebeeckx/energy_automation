@@ -1107,35 +1107,66 @@ def _loads_foreign(consumers: list[tuple[str, float]] | None) -> str:
 
 
 def _modes_foreign(pw: PowerReading | None, ev: ChargerState | None) -> str:
-    """Dashboard control panel: enable/disable the automation.
+    """Dashboard control panel: per-action enable toggles + kill switch.
 
-    The legacy 5-button mode picker (surplus / morning_dump / trickle /
-    manual / off) collapsed into two buttons: "Enabled" and "Disabled".
-    Per-action enable flags live in Settings; the kill switch is the
-    user-facing "shut everything off" interrupt. EVSE amperage during
-    disable is set from the Emporia app directly.
+    Three buttons stacked vertically:
+      1. Morning Dump — toggles `settings.morning_dump_enabled`
+      2. Surplus      — toggles `settings.surplus_enabled`
+      3. Disable All / Enable All — engages/releases the kill switch.
+
+    Per-action buttons show as active only when their flag is True AND
+    the kill switch is not engaged (the kill switch overrides). EVSE
+    amperage during a kill is set from the Emporia app directly.
     """
     ctl = _ctl()
-    active = "off" if ctl.kill_switch else "on"
+    last = ctl.last_decision
+    current_action = last.action_name if last else None
 
-    def _btn(value: str, label: str, sub: str) -> str:
-        cls = "mode-btn active" if value == active else "mode-btn"
+    def _btn(value: str, label: str, sub: str, active: bool) -> str:
+        cls = "mode-btn active" if active else "mode-btn"
         return (
-            f'<button type="submit" name="state" value="{value}" class="{cls}">'
+            f'<button type="submit" name="action" value="{value}" class="{cls}">'
             f'{label}<small>{sub}</small></button>'
         )
 
-    last = ctl.last_decision
-    on_sub = (
-        f'{_mode_label(ctl).lower()} &middot; {last.target_amps} A'
-        if (last and last.action_name not in ("kill_switch", "", "none"))
-        else _mode_label(ctl).lower()
-    )
-    off_sub = "EVSE under your manual control"
+    # Morning Dump
+    md_enabled = bool(getattr(ctl.settings, "morning_dump_enabled", True))
+    md_active = md_enabled and not ctl.kill_switch
+    if md_active:
+        md_sub = "firing" if current_action == "morning_dump" else "enabled / idle"
+    else:
+        if ctl.kill_switch:
+            md_sub = "kill switch on"
+        else:
+            md_sub = "disabled"
+
+    # Surplus
+    sp_enabled = bool(getattr(ctl.settings, "surplus_enabled", True))
+    sp_active = sp_enabled and not ctl.kill_switch
+    if sp_active:
+        sp_sub = "firing" if current_action == "surplus" else "enabled / idle"
+    else:
+        if ctl.kill_switch:
+            sp_sub = "kill switch on"
+        else:
+            sp_sub = "disabled"
+
+    # Kill switch button
+    if ctl.kill_switch:
+        ks_value = "release_kill_switch"
+        ks_label = "Enable All"
+        ks_sub = "kill switch on &middot; click to release"
+        ks_active = True
+    else:
+        ks_value = "engage_kill_switch"
+        ks_label = "Disable All"
+        ks_sub = "kill switch off"
+        ks_active = False
 
     rows = [
-        _btn("on", "Enabled", on_sub),
-        _btn("off", "Disabled", off_sub),
+        _btn("toggle_morning_dump", "Morning Dump", md_sub, md_active),
+        _btn("toggle_surplus", "Surplus", sp_sub, sp_active),
+        _btn(ks_value, ks_label, ks_sub, ks_active),
     ]
     x, y, w, h = _MODES_PANEL
     return (
@@ -1541,20 +1572,34 @@ def index(demo: str = "") -> str:
 
 
 @app.post("/mode")
-def set_mode(state: Annotated[str, Form()]) -> RedirectResponse:
-    """Enable or disable automation.
+def set_mode(action: Annotated[str, Form()]) -> RedirectResponse:
+    """Per-action enable toggles + kill switch.
 
-    `state` is "on" (release kill switch) or "off" (engage it). The
-    next `_control_tick` picks up the change naturally — no need to
-    push anything to the EVSE here.
+    `action` is one of:
+      - "toggle_morning_dump" / "toggle_surplus" — flip the matching
+        Settings flag in place (in-memory only; not persisted).
+      - "engage_kill_switch" / "release_kill_switch" — kill switch.
+
+    The next `_control_tick` picks up the change naturally — no need
+    to push anything to the EVSE here.
     """
     ctl = _ctl()
-    if state == "off":
+    if action == "toggle_morning_dump":
+        new_state = not bool(getattr(ctl.settings, "morning_dump_enabled", True))
+        ctl.settings.morning_dump_enabled = new_state
+        logger.info("morning_dump_enabled -> {} (user)", new_state)
+    elif action == "toggle_surplus":
+        new_state = not bool(getattr(ctl.settings, "surplus_enabled", True))
+        ctl.settings.surplus_enabled = new_state
+        logger.info("surplus_enabled -> {} (user)", new_state)
+    elif action == "engage_kill_switch":
         ctl.engage_kill_switch()
         logger.info("automation disabled by user (kill switch engaged)")
-    elif state == "on":
+    elif action == "release_kill_switch":
         ctl.release_kill_switch()
         logger.info("automation enabled by user (kill switch released)")
+    else:
+        logger.warning("/mode: ignoring unknown action {!r}", action)
     return RedirectResponse("/", status_code=303)
 
 
