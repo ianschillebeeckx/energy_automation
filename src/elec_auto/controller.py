@@ -76,7 +76,7 @@ def compute_target(
 
     if mode == "surplus":
         if pw is None or ev is None:
-            return Decision(0, "waiting on telemetry")
+            return Decision(0, "waiting on telemetry", on=False)
         return decide_ev_amps(pw, ev, settings)
 
     if mode == "trickle":

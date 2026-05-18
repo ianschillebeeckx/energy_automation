@@ -22,13 +22,22 @@ from .powerwall import PowerReading
 
 @dataclass(slots=True)
 class Decision:
+    """A control-loop verdict: rate to configure and whether to actually charge.
+
+    `on` defaults to False so that any Decision constructed without an
+    explicit `on=` is fail-safe (the EVSE stays paused). The previous
+    True default once let a stray ``Decision(0, "waiting on telemetry")``
+    start the charger at its last-configured rate; the flipped default
+    makes "I didn't say on, so don't turn on" the natural read.
+    """
+
     target_amps: int
     reason: str
     # Whether the EVSE should be charging *right now*. When False, target_amps
     # still carries the rate the controller thinks the charger should be
     # configured at (e.g. the preview for a scheduled mode), so the dashboard
     # shows something meaningful while the breaker is paused.
-    on: bool = True
+    on: bool = False
 
 
 def decide_ev_amps(
