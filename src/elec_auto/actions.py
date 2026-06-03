@@ -102,19 +102,34 @@ class Surplus:
 
     def decide(self, state: State, ctx: ActionContext) -> Decision:
         s = ctx.settings
-        # Subtract the EV's own draw so we don't think we have more
-        # surplus than we do. Prefer the measured Emporia EV-circuit
-        # reading — the proxy `ev_amps × voltage` is a phantom when the
-        # EVSE is configured ON but the car is Standby/Disconnected,
-        # which made the controller ratchet to the max amperage even
-        # with the car unplugged.
-        if state.ev_circuit_w is not None:
+        # EV self-draw estimate, subtracted from load_w to get the
+        # "true" non-EV load. Source depends on EVSE status:
+        #
+        #   "Charging": use the configured rate × voltage. Tracks real
+        #     draw within a few %, and crucially it's *instantaneous* —
+        #     the same time-base as pw.load_w. The measured Emporia
+        #     `ev_circuit_w` is a 1-minute rolling cloud average
+        #     (`Scale.MINUTE` in emporia.py), so subtracting it from an
+        #     instantaneous PW3 load produced a phantom non-EV load
+        #     each time a charging session started, which made Surplus
+        #     bounce ON→OFF on a ~1 min cycle.
+        #
+        #   anything else: trust the measured Emporia value. In
+        #     Standby/Disconnected the EVSE is configured at some rate
+        #     but the contactor is open and the car draws ~0, so the
+        #     configured proxy would phantom-add kW of "EV draw".
+        #
+        #   no Emporia reading and not Charging: legacy proxy
+        #     fallback for first-tick / test paths where Emporia hasn't
+        #     reported yet.
+        if state.ev_on and state.ev_status == "Charging":
+            ev_w_now = (state.ev_amps or 0) * s.ev_voltage
+        elif state.ev_circuit_w is not None:
             ev_w_now = state.ev_circuit_w
+        elif state.ev_on:
+            ev_w_now = (state.ev_amps or 0) * s.ev_voltage
         else:
-            ev_w_now = (
-                (state.ev_amps or 0) * s.ev_voltage
-                if state.ev_on else 0
-            )
+            ev_w_now = 0
         non_ev_load_w = (state.load_w or 0) - ev_w_now
         surplus_w = (state.solar_w or 0) - non_ev_load_w
 

@@ -29,7 +29,7 @@ from .forecast import soc_forecast as _soc_forecast
 from .nws import NWS
 from .state import em_panel_sum
 from .policy import Decision
-from .powerwall import Powerwall, PowerReading
+from .powerwall import Powerwall, PowerReading, PowerwallUnavailable
 from .samples import (
     Forecast, ForecastStore, LoadStore, ObservationStore, Sample, SampleStore,
     WeatherStore,
@@ -41,6 +41,10 @@ from .solcast import Solcast, daily_schedule
 @asynccontextmanager
 async def _lifespan(app_: FastAPI):
     loop = asyncio.get_running_loop()
+    # Seed the dashboard cache from the most recent DB sample so the very
+    # first page load has real (if stale) numbers instead of "no data
+    # yet". The control loop will overwrite within poll_interval_sec.
+    _warm_cache_from_db()
     tasks = [loop.create_task(_control_loop())]
     logger.info("control loop started (interval={}s)", settings.poll_interval_sec)
     if settings.solcast_api_key and settings.solcast_resource_id:
@@ -65,6 +69,15 @@ app = FastAPI(title="elec_auto", docs_url=None, redoc_url=None, lifespan=_lifesp
 
 _pw: Powerwall | None = None
 _em: Emporia | None = None
+# Last good readings, populated by _control_tick and read by _render so
+# the dashboard never blocks on a network call. Decoupling render from
+# fetch is what makes the page feel instant on mobile — Emporia's cloud
+# in particular can take 5–10 s on a slow LTE link. The control loop
+# already runs every poll_interval_sec, so cache age is bounded by that.
+_last_pw_reading: PowerReading | None = None
+_last_pw_ts: float = 0.0
+_last_ev_state: ChargerState | None = None
+_last_ev_ts: float = 0.0
 _samples: SampleStore | None = None
 _forecasts: ForecastStore | None = None
 _loads: LoadStore | None = None
@@ -154,12 +167,43 @@ def _emporia() -> Emporia:
     return _em
 
 
+# Module-level counter for PW3 read-failure log throttling. The gateway
+# client supplies the rate limit (its own exponential back-off, capped at
+# 5 min between real attempts), so we just need to skip the per-tick
+# in-back-off raises and log each real attempt that fails. Net effect:
+# a sustained outage produces one traceback at the start and one short
+# heartbeat per cap-period (~5 min) thereafter, plus a recovery line.
+_pw_failure_streak = 0
+
+
 def _safe_pw() -> tuple[PowerReading | None, str | None]:
+    global _pw_failure_streak
     try:
-        return _powerwall().read(), None
-    except Exception as e:
-        logger.exception("powerwall read failed")
+        reading = _powerwall().read()
+    except PowerwallUnavailable as e:
+        # Inside the gateway's back-off window — not a fresh attempt,
+        # nothing new to say. Stay silent so the log stays readable.
         return None, str(e)
+    except Exception as e:
+        _pw_failure_streak += 1
+        if _pw_failure_streak == 1:
+            # First failure: full traceback so we can see what broke.
+            logger.exception("powerwall read failed (entering back-off)")
+        else:
+            # Subsequent real attempts (gated by the gateway back-off,
+            # so at most one per ~5 min). One-liner — the originating
+            # traceback is already in the log a few minutes up.
+            logger.warning(
+                "powerwall still failing ({} consecutive): {}",
+                _pw_failure_streak, e,
+            )
+        return None, str(e)
+    if _pw_failure_streak > 0:
+        logger.info(
+            "powerwall recovered after {} failed read(s)", _pw_failure_streak,
+        )
+        _pw_failure_streak = 0
+    return reading, None
 
 
 def _safe_em() -> tuple[ChargerState | None, str | None]:
@@ -168,6 +212,82 @@ def _safe_em() -> tuple[ChargerState | None, str | None]:
     except Exception as e:
         logger.exception("emporia read failed")
         return None, str(e)
+
+
+def _warm_cache_from_db() -> None:
+    """Seed `_last_pw_reading` / `_last_ev_state` from the newest sample row.
+
+    Bridges the gap between server start and the first network tick (10–15 s).
+    The dashboard renders this immediately; the staleness banner uses the
+    sample's real timestamp so it's obvious the data is from before the
+    restart, not live. Best-effort — any failure is swallowed because
+    "no warm data" is a survivable fallback.
+    """
+    global _last_pw_reading, _last_pw_ts, _last_ev_state, _last_ev_ts
+    try:
+        # The most recent ~60 s of samples — enough to find one non-empty
+        # row even if the latest tick was missing telemetry.
+        import time as _time
+        now = int(_time.time())
+        rows = _sample_store().read_range(now - 300, now)
+    except Exception:
+        logger.exception("warm cache from db: query failed")
+        return
+    if not rows:
+        return
+    latest = max(rows, key=lambda r: r.ts)
+
+    # PowerReading: needs all four watts + SoC to be useful. Missing
+    # values are fine to substitute 0 — the staleness banner will flag
+    # this isn't live anyway.
+    if any(v is not None for v in
+           (latest.solar_w, latest.load_w, latest.battery_w, latest.grid_w)):
+        _last_pw_reading = PowerReading(
+            solar_w=latest.solar_w or 0.0,
+            load_w=latest.load_w or 0.0,
+            battery_w=latest.battery_w or 0.0,
+            grid_w=latest.grid_w or 0.0,
+            battery_soc_pct=latest.soc_pct if latest.soc_pct is not None else float("nan"),
+        )
+        _last_pw_ts = float(latest.ts)
+
+    # ChargerState: gid / name / max_charge_rate_a aren't persisted in
+    # Sample, so we substitute neutral placeholders. The real values
+    # land the moment _control_tick fetches Emporia for the first time.
+    if latest.charger_amps is not None or latest.charger_on is not None:
+        _last_ev_state = ChargerState(
+            gid=0,
+            name="EV Charger",
+            on=bool(latest.charger_on) if latest.charger_on is not None else False,
+            charge_rate_a=latest.charger_amps or 0,
+            max_charge_rate_a=settings.ev_max_amps,
+            status=latest.charger_status or "",
+        )
+        _last_ev_ts = float(latest.ts)
+
+
+def _staleness_msg(last_ts: float, source: str) -> str | None:
+    """Build the dashboard's "stale Ns ago" hint, or None if fresh.
+
+    Threshold is 3× the poll interval — enough headroom that one missed
+    tick doesn't flag, but a real outage does.
+    """
+    if last_ts == 0.0:
+        return f"{source} unavailable (no data yet)"
+    age = time.time() - last_ts
+    if age > settings.poll_interval_sec * 3:
+        return f"{source} stale ({age:.0f}s ago)"
+    return None
+
+
+def _cached_pw() -> tuple[PowerReading | None, str | None]:
+    """Last good PW3 reading + a staleness hint. Never touches the network."""
+    return _last_pw_reading, _staleness_msg(_last_pw_ts, "Powerwall")
+
+
+def _cached_ev() -> tuple[ChargerState | None, str | None]:
+    """Last good Emporia reading + a staleness hint. Never touches the network."""
+    return _last_ev_state, _staleness_msg(_last_ev_ts, "Emporia")
 
 
 # Channels we never want to show in "Top loads": the synthetic Main /
@@ -295,8 +415,19 @@ def _control_tick() -> None:
     """
     from zoneinfo import ZoneInfo
 
+    global _last_pw_reading, _last_pw_ts, _last_ev_state, _last_ev_ts
+
     pw, _ = _safe_pw()
     ev, _ = _safe_em()
+    # Stash the latest good readings for the dashboard. Hold the prior
+    # value on failure so the page still has something to render during
+    # transient outages — _render uses the timestamp to flag staleness.
+    if pw is not None:
+        _last_pw_reading = pw
+        _last_pw_ts = time.time()
+    if ev is not None:
+        _last_ev_state = ev
+        _last_ev_ts = time.time()
 
     now_ts = int(time.time())
     pv_forecasts = _forecast_store().operational_in_range(
@@ -716,7 +847,9 @@ def _chart_svg() -> str:
         f'stroke="currentColor" stroke-width="1" opacity="0.35"/>'
     )
 
-    def series_polyline(getter, stroke: str, smooth: int = 1) -> str:
+    def series_polyline(
+        getter, stroke: str, smooth: int = 1, dasharray: str | None = None,
+    ) -> str:
         # Break the polyline at gaps (NULL readings) so we don't connect
         # across telemetry outages. With smooth>1, apply a centered moving
         # average within each segment before mapping to chart coords.
@@ -750,9 +883,10 @@ def _chart_svg() -> str:
                 smoothed.append(sm)
             segments = smoothed
 
+        dash_attr = f' stroke-dasharray="{dasharray}"' if dasharray else ""
         return "".join(
             f'<polyline points="{" ".join(f"{x_for(ts):.1f},{y_for(v):.1f}" for ts, v in seg)}" '
-            f'fill="none" stroke="{stroke}" stroke-width="1.5"/>'
+            f'fill="none" stroke="{stroke}" stroke-width="1.5"{dash_attr}/>'
             for seg in segments if len(seg) >= 2
         )
 
@@ -785,6 +919,16 @@ def _chart_svg() -> str:
     # Actual solar: orange to match the solar node in the diagram above.
     # 3-point centered moving average smooths the 30 s sample jitter.
     parts.append(series_polyline(lambda s: s.solar_w, "#e8a33d", smooth=3))
+    # Grid: one trace on the positive axis (|grid_w|). Export = solid,
+    # import = dashed; segments break naturally at the sign change.
+    parts.append(series_polyline(
+        lambda s: (-s.grid_w if s.grid_w is not None and s.grid_w < 0 else None),
+        "#9b6dc7", smooth=3,
+    ))
+    parts.append(series_polyline(
+        lambda s: (s.grid_w if s.grid_w is not None and s.grid_w > 0 else None),
+        "#9b6dc7", smooth=3, dasharray="4 3",
+    ))
     # Solcast forecast: dashed teal so it reads as "predicted" rather than
     # measured. Spans the full window (past forecasts that we kept + future
     # predictions for the right half).
@@ -875,6 +1019,10 @@ def _chart_svg() -> str:
         '<tspan fill="currentColor">load</tspan>'
         '<tspan dx="14" fill="#2ea56a">━━ </tspan>'
         '<tspan fill="currentColor">SoC</tspan>'
+        '<tspan dx="14" fill="#9b6dc7">━ </tspan>'
+        '<tspan fill="currentColor">export / </tspan>'
+        '<tspan fill="#9b6dc7">┅ </tspan>'
+        '<tspan fill="currentColor">import</tspan>'
         '</text>'
     )
 
@@ -1439,8 +1587,11 @@ def _render(flash: str = "", flash_ok: bool = True, demo: str = "") -> str:
         pw, ev, consumers = _demo_state(demo)
         pw_err = ev_err = None
     else:
-        pw, pw_err = _safe_pw()
-        ev, ev_err = _safe_em()
+        # Read from cache, not the network. The control loop refreshes
+        # these every poll_interval_sec; mobile page loads stay instant
+        # even when Emporia's cloud is sluggish.
+        pw, pw_err = _cached_pw()
+        ev, ev_err = _cached_ev()
         consumers = _safe_top_consumers()
     # Use the Controller's most recent decision rather than re-running it
     # synchronously per page render. If we don't have one yet (first
@@ -1453,23 +1604,35 @@ def _render(flash: str = "", flash_ok: bool = True, demo: str = "") -> str:
     def fmt_w(v: float) -> str:
         return f"{v:+.0f} W" if v else "0 W"
 
-    pw_rows = (
-        f"<tr><td>solar</td><td>{fmt_w(pw.solar_w)}</td></tr>"
-        f"<tr><td>home load</td><td>{fmt_w(pw.load_w)}</td></tr>"
-        f"<tr><td>battery</td><td>{fmt_w(pw.battery_w)} "
-        f"<small>({'discharging' if pw.battery_w > 0 else 'charging' if pw.battery_w < 0 else 'idle'})</small></td></tr>"
-        f"<tr><td>grid</td><td>{fmt_w(pw.grid_w)} "
-        f"<small>({'importing' if pw.grid_w > 0 else 'exporting' if pw.grid_w < 0 else 'balanced'})</small></td></tr>"
-        f"<tr><td>SoC</td><td><b>{pw.battery_soc_pct:.1f} %</b></td></tr>"
-        if pw
-        else f"<tr><td colspan=2 class=err>Powerwall unavailable: {html.escape(pw_err or '')}</td></tr>"
-    )
+    # `pw_err` / `ev_err` may be non-None even when the reading itself is
+    # present — that means "we have last-known data but it's stale." Show
+    # the data plus a staleness banner; only fall back to "unavailable"
+    # when we've literally never had a reading.
+    def _stale_banner(err: str | None) -> str:
+        if not err:
+            return ""
+        return f"<tr><td colspan=2 class=err>{html.escape(err)}</td></tr>"
+
+    if pw:
+        pw_rows = (
+            _stale_banner(pw_err)
+            + f"<tr><td>solar</td><td>{fmt_w(pw.solar_w)}</td></tr>"
+            f"<tr><td>home load</td><td>{fmt_w(pw.load_w)}</td></tr>"
+            f"<tr><td>battery</td><td>{fmt_w(pw.battery_w)} "
+            f"<small>({'discharging' if pw.battery_w > 0 else 'charging' if pw.battery_w < 0 else 'idle'})</small></td></tr>"
+            f"<tr><td>grid</td><td>{fmt_w(pw.grid_w)} "
+            f"<small>({'importing' if pw.grid_w > 0 else 'exporting' if pw.grid_w < 0 else 'balanced'})</small></td></tr>"
+            f"<tr><td>SoC</td><td><b>{pw.battery_soc_pct:.1f} %</b></td></tr>"
+        )
+    else:
+        pw_rows = f"<tr><td colspan=2 class=err>Powerwall unavailable: {html.escape(pw_err or '')}</td></tr>"
 
     if ev:
         amps_value = ev.charge_rate_a
         on_checked = "checked" if ev.on else ""
         ev_rows = (
-            f"<tr><td>name</td><td>{html.escape(ev.name)} <small>(gid {ev.gid})</small></td></tr>"
+            _stale_banner(ev_err)
+            + f"<tr><td>name</td><td>{html.escape(ev.name)} <small>(gid {ev.gid})</small></td></tr>"
             f"<tr><td>state</td><td><b>{'ON' if ev.on else 'OFF'}</b></td></tr>"
             f"<tr><td>rate</td><td>{ev.charge_rate_a} A <small>(max {ev.max_charge_rate_a} A)</small></td></tr>"
         )

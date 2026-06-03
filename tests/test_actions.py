@@ -53,6 +53,7 @@ def _state(
     battery: float | None = 0.0,
     ev_amps: int | None = 0,
     ev_on: bool | None = False,
+    ev_status: str | None = None,
     ev_circuit_w: float | None = None,
 ) -> State:
     return State(
@@ -63,6 +64,7 @@ def _state(
         load_w=load,
         ev_amps=ev_amps,
         ev_on=ev_on,
+        ev_status=ev_status,
         ev_circuit_w=ev_circuit_w,
     )
 
@@ -205,6 +207,51 @@ def test_surplus_decide_uses_measured_ev_circuit_w_over_proxy() -> None:
         ev_on=True, ev_amps=40, ev_circuit_w=14.0,
     )
     d = a.decide(st, _ctx())
+    assert d.target_amps == 10
+    assert d.on is True
+
+
+def test_surplus_decide_prefers_configured_rate_when_charging() -> None:
+    """Regression for the 2026-05-30 oscillation bug: pw.load_w is
+    instantaneous but Emporia's ev_circuit_w is a 1-minute rolling
+    average. When the EV is actively Charging, the action must use the
+    configured-rate proxy (same time-base as load_w) rather than the
+    lagged Emporia value — otherwise each new session phantom-detects
+    a huge non-EV load and the EV is switched off the tick after it
+    starts.
+
+    Scenario: solar 5300 W, PW3 instant load 4880 W (includes 12 A EV
+    that just turned on), Emporia ev_circuit_w still showing 1200 W
+    (1-min average across mostly-off seconds).
+    """
+    a = Surplus()
+    st = _state(
+        soc=85, solar=5300, load=4880,
+        ev_on=True, ev_amps=12, ev_status="Charging",
+        ev_circuit_w=1200.0,
+    )
+    d = a.decide(st, _ctx())
+    # With fix: ev_w_now = 12*240 = 2880, non_ev = 4880-2880 = 2000,
+    # surplus = 5300-2000 = 3300 → 13 A. Stable across the lag window.
+    # Without fix: ev_w_now = 1200 (lagged), non_ev = 3680,
+    # surplus = 1620 → 6 A or below-min, cycling off.
+    assert d.target_amps == 13
+    assert d.on is True
+
+
+def test_surplus_decide_uses_circuit_w_when_standby_even_if_configured_on() -> None:
+    """Phantom-draw protection: EVSE configured ON at 40 A but car is
+    Standby (contactor open, car not pulling). Trust the measured
+    Emporia value over the configured-rate proxy.
+    """
+    a = Surplus()
+    st = _state(
+        soc=85, solar=3000, load=400,
+        ev_on=True, ev_amps=40, ev_status="Standby",
+        ev_circuit_w=14.0,
+    )
+    d = a.decide(st, _ctx())
+    # Real non-EV load = 400 - 14 = 386 W; surplus = 2614 W → 10 A.
     assert d.target_amps == 10
     assert d.on is True
 

@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS forecasts (
     PRIMARY KEY (period_ts, fetched_at, source)
 );
 CREATE INDEX IF NOT EXISTS idx_forecasts_period ON forecasts(period_ts);
+CREATE INDEX IF NOT EXISTS idx_forecasts_source_fetched ON forecasts(source, fetched_at);
 CREATE TABLE IF NOT EXISTS weather (
     period_ts        INTEGER NOT NULL,
     fetched_at       INTEGER NOT NULL,
@@ -314,21 +315,34 @@ class ForecastStore:
         contains `fetched_at` — i.e. "what did Solcast predict for the
         moment we made the call?". Useful for placing markers on the
         chart's forecast line.
+
+        Implementation note: the prior version used a correlated
+        subquery (`period_ts = (SELECT ... ORDER BY ABS(...) LIMIT 1)`)
+        which forced a full table scan per outer row — ~3.6 s on a
+        27 k-row table and the dominant cost of the dashboard's first-
+        byte time. ROW_NUMBER() over a partition does the same in one
+        pass, and the new `idx_forecasts_source_fetched` index narrows
+        the outer scan.
         """
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT f.fetched_at, f.pv_w_p50
-                FROM forecasts f
-                WHERE f.source = ?
-                  AND f.fetched_at BETWEEN ? AND ?
-                  AND f.period_ts = (
-                      SELECT period_ts FROM forecasts f2
-                      WHERE f2.source = f.source AND f2.fetched_at = f.fetched_at
-                      ORDER BY ABS(f2.period_ts - f2.fetched_at)
-                      LIMIT 1
-                  )
-                ORDER BY f.fetched_at
+                WITH ranked AS (
+                    SELECT
+                        fetched_at,
+                        pv_w_p50,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY source, fetched_at
+                            ORDER BY ABS(period_ts - fetched_at)
+                        ) AS rn
+                    FROM forecasts
+                    WHERE source = ?
+                      AND fetched_at BETWEEN ? AND ?
+                )
+                SELECT fetched_at, pv_w_p50
+                FROM ranked
+                WHERE rn = 1
+                ORDER BY fetched_at
                 """,
                 (source, start_ts, end_ts),
             ).fetchall()
