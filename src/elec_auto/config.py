@@ -59,6 +59,27 @@ class Settings(BaseSettings):
     # it partitions cleanly with Surplus by SoC: SolarPassthrough fires
     # below the reserve, Surplus above it.
     solar_passthrough_enabled: bool = False
+    # PeakExport drives the *Powerwall* (not the EV) — flips to TBC and
+    # lowers the reserve so the firmware dispatches battery → grid during
+    # the evening peak window. The buy/sell math that actually triggers
+    # discharge lives in a custom tariff the user uploads via the Tesla
+    # app (e.g. "Force Discharge June" with sell ON_PEAK = $1/kWh); this
+    # action just makes sure mode + reserve are set so the firmware can
+    # act on that tariff.
+    peak_export_enabled: bool = False
+    # SoC we want the battery to land on at end-of-discharge. Tesla's
+    # firmware auto-throttles discharge to land here exactly at the end
+    # of its custom-tariff ON_PEAK window, so this doubles as the
+    # discharge target *and* the cutoff.
+    peak_export_floor_pct: int = Field(default=40, ge=10, le=90)
+    # Peak window (local time, 24h). Must align with the user's custom
+    # Tesla tariff ON_PEAK block; the firmware obeys its own tariff for
+    # the actual buy/sell math, we just flip mode at start_hour and
+    # restore at end_hour. Earlier "late as possible" sizing was
+    # redundant — Tesla rate-shapes discharge based on
+    # (soc − reserve) / time_remaining_in_ON_PEAK.
+    peak_export_start_hour: int = Field(default=19, ge=0, le=23)
+    peak_export_end_hour: int = Field(default=20, ge=0, le=23)
 
     # Powerwall usable capacity (kWh). One PW3 unit is 13.5 kWh; override
     # in .env if the site has more. Used by the morning-dump calculator.

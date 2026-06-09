@@ -42,6 +42,17 @@ class Decision:
     # from the winning action's `name`. "" for kill-switch / "no action
     # applies" / direct policy.decide_ev_amps() callers.
     action_name: str = ""
+    # Which downstream system this Decision targets. Default "ev" keeps
+    # the existing EV-shaped fields meaningful; "pw3" means dispatch this
+    # one to the Powerwall cloud client (pw3_cloud.py) instead, in which
+    # case `target_amps`/`on` are ignored and the pw3_* fields below
+    # carry the instructions. "none" is a no-op Decision (kill-switch /
+    # "no action applies"). Adding new targets here is the extension
+    # point for "control X via the controller pipeline."
+    target_system: str = "ev"            # "ev" | "pw3" | "none"
+    # PW3-specific instructions, only meaningful when target_system == "pw3".
+    pw3_mode: str | None = None          # "autonomous" | "self_consumption" | "backup"
+    pw3_reserve_pct: int | None = None
 
 
 def decide_ev_amps(

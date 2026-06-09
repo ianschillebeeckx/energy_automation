@@ -14,7 +14,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from elec_auto.actions import (
-    DEFAULT_ACTIONS, ActionContext, MorningDump, SolarPassthrough, Surplus,
+    DEFAULT_ACTIONS, ActionContext, MorningDump, PeakExport,
+    SolarPassthrough, Surplus,
 )
 from elec_auto.config import Settings
 from elec_auto.samples import Forecast, LoadStore, Sample, SampleStore
@@ -517,4 +518,101 @@ def test_solar_passthrough_decide_below_min_returns_zero_off() -> None:
 
 def test_default_actions_contains_known_actions() -> None:
     names = {type(a).__name__ for a in DEFAULT_ACTIONS}
-    assert names == {"MorningDump", "SolarPassthrough", "Surplus"}
+    assert names == {"MorningDump", "PeakExport", "SolarPassthrough", "Surplus"}
+
+
+# --- PeakExport --------------------------------------------------------------
+
+
+def _settings_pe(**kw):
+    """Settings preset for PeakExport tests."""
+    defaults = dict(
+        peak_export_enabled=True,
+        peak_export_floor_pct=40,
+        peak_export_start_hour=19,
+        peak_export_end_hour=20,
+        battery_capacity_kwh=13.5,
+    )
+    defaults.update(kw)
+    return _settings(**defaults)
+
+
+def _t(month: int, day: int, hour: int, minute: int = 0):
+    """tz-aware datetime in the test timezone."""
+    return datetime(2026, month, day, hour, minute, tzinfo=_TZ)
+
+
+def test_peak_export_applies_july_weekday_inside_window() -> None:
+    """July weekday 7:30 PM with SoC=100% should fire (window 19-20)."""
+    a = PeakExport()
+    # 2026-07-08 is a Wednesday.
+    ctx = _ctx(now=_t(7, 8, 19, 30), settings=_settings_pe())
+    st = _state(soc=100.0)
+    assert a.applies(st, ctx) is True
+
+
+def test_peak_export_does_not_apply_outside_summer_months() -> None:
+    """September is not in PEAK_DAYS_BY_MONTH."""
+    a = PeakExport()
+    # 2026-09-02 is a Wednesday at 7:30 PM.
+    ctx = _ctx(now=_t(9, 2, 19, 30), settings=_settings_pe())
+    st = _state(soc=100.0)
+    assert a.applies(st, ctx) is False
+
+
+def test_peak_export_no_weekend_in_june() -> None:
+    """June weekend excluded (June: weekday only)."""
+    a = PeakExport()
+    # 2026-06-13 is a Saturday at 7:30 PM.
+    ctx = _ctx(now=_t(6, 13, 19, 30), settings=_settings_pe())
+    st = _state(soc=100.0)
+    assert a.applies(st, ctx) is False
+
+
+def test_peak_export_august_weekend_applies() -> None:
+    """August weekend included (August: weekday + weekend)."""
+    a = PeakExport()
+    # 2026-08-08 is a Saturday at 7:30 PM.
+    ctx = _ctx(now=_t(8, 8, 19, 30), settings=_settings_pe())
+    st = _state(soc=100.0)
+    assert a.applies(st, ctx) is True
+
+
+def test_peak_export_does_not_apply_below_floor() -> None:
+    """SoC at/below floor — no headroom to discharge."""
+    a = PeakExport()
+    ctx = _ctx(now=_t(7, 8, 19, 30), settings=_settings_pe(peak_export_floor_pct=40))
+    st = _state(soc=40.0)
+    assert a.applies(st, ctx) is False
+    st2 = _state(soc=39.0)
+    assert a.applies(st2, ctx) is False
+
+
+def test_peak_export_does_not_apply_after_end_hour() -> None:
+    """Past peak_export_end_hour (20:00) — window closed."""
+    a = PeakExport()
+    ctx = _ctx(now=_t(7, 8, 20, 5), settings=_settings_pe())
+    st = _state(soc=100.0)
+    assert a.applies(st, ctx) is False
+
+
+def test_peak_export_does_not_apply_before_start_hour() -> None:
+    """Before peak_export_start_hour (19:00) — window not yet open."""
+    a = PeakExport()
+    ctx = _ctx(now=_t(7, 8, 18, 59), settings=_settings_pe())
+    st = _state(soc=100.0)
+    assert a.applies(st, ctx) is False
+
+
+def test_peak_export_decide_returns_pw3_target() -> None:
+    """decide() emits a PW3-targeted Decision with mode + reserve set."""
+    a = PeakExport()
+    ctx = _ctx(now=_t(7, 8, 19, 30), settings=_settings_pe(peak_export_floor_pct=40))
+    st = _state(soc=95.0)
+    d = a.decide(st, ctx)
+    assert d.target_system == "pw3"
+    assert d.pw3_mode == "autonomous"
+    assert d.pw3_reserve_pct == 40
+    # EV-shaped fields meaningless but should be present + safe.
+    assert d.target_amps == 0
+    assert d.on is False

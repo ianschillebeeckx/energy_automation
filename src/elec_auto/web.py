@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import math
 import time
+from pathlib import Path
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Annotated
@@ -30,6 +32,7 @@ from .nws import NWS
 from .state import em_panel_sum
 from .policy import Decision
 from .powerwall import Powerwall, PowerReading, PowerwallUnavailable
+from .pw3_cloud import PW3CloudClient, PW3State
 from .samples import (
     Forecast, ForecastStore, LoadStore, ObservationStore, Sample, SampleStore,
     WeatherStore,
@@ -69,6 +72,7 @@ app = FastAPI(title="elec_auto", docs_url=None, redoc_url=None, lifespan=_lifesp
 
 _pw: Powerwall | None = None
 _em: Emporia | None = None
+_pw3_cloud: PW3CloudClient | None = None
 # Last good readings, populated by _control_tick and read by _render so
 # the dashboard never blocks on a network call. Decoupling render from
 # fetch is what makes the page feel instant on mobile — Emporia's cloud
@@ -150,6 +154,8 @@ def _mode_label(ctl: Controller) -> str:
         return "Solar → EV"
     if d.action_name == "morning_dump":
         return "Morning dump"
+    if d.action_name == "peak_export":
+        return "Peak export"
     if d.action_name == "kill_switch":
         return "Disabled"
     return "Idle"
@@ -371,15 +377,57 @@ def _next_dump_start(s) -> datetime:
     return next_dump_window(datetime.now(ZoneInfo(s.timezone)), s)[0]
 
 
-def _apply_target(decision: Decision) -> None:
-    """Push a target decision to the EVSE.
+def _pw3_client() -> PW3CloudClient:
+    """Module-level Fleet API client singleton. Built lazily."""
+    global _pw3_cloud
+    if _pw3_cloud is None:
+        _pw3_cloud = PW3CloudClient(auth_path=settings.powerwall_auth_path)
+    return _pw3_cloud
 
-    If the controller wants the charger on, push (amps, on=True). If it
-    wants off but we still have a preview amperage (e.g. scheduled
-    morning_dump), push (amps, on=False) so the dashboard reflects the
-    intended rate. If there's no meaningful rate, just flip the switch
-    off and leave whatever amperage the user configured manually.
+
+_PEAK_BASELINE_PATH = Path("state") / "peak_export_baseline.json"
+
+
+def _save_peak_baseline(s: PW3State) -> None:
+    """Persist (mode, reserve) so we know what to restore to after peak.
+
+    Written once when PeakExport first engages; consulted when we leave
+    the peak window. Survives restarts so a crash mid-discharge doesn't
+    leave the PW3 stuck in TBC forever.
     """
+    try:
+        _PEAK_BASELINE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _PEAK_BASELINE_PATH.write_text(json.dumps(
+            {"mode": s.mode, "reserve_pct": s.reserve_pct},
+        ))
+        logger.info(
+            "peak_export: saved baseline mode={!r} reserve={}",
+            s.mode, s.reserve_pct,
+        )
+    except Exception:
+        logger.exception("peak_export: failed to write baseline")
+
+
+def _read_peak_baseline() -> PW3State | None:
+    try:
+        if not _PEAK_BASELINE_PATH.exists():
+            return None
+        data = json.loads(_PEAK_BASELINE_PATH.read_text())
+        return PW3State(mode=data["mode"], reserve_pct=int(data["reserve_pct"]))
+    except Exception:
+        logger.exception("peak_export: failed to read baseline")
+        return None
+
+
+def _clear_peak_baseline() -> None:
+    try:
+        _PEAK_BASELINE_PATH.unlink(missing_ok=True)
+    except Exception:
+        logger.exception("peak_export: failed to clear baseline")
+
+
+def _apply_ev_decision(decision: Decision) -> None:
+    """Push an EV-targeted Decision to the EVSE."""
     try:
         em = _emporia()
     except Exception:
@@ -400,6 +448,96 @@ def _apply_target(decision: Decision) -> None:
             logger.info("apply: action={} off ({})", action, decision.reason)
     except Exception:
         logger.exception("apply: push to EVSE failed")
+
+
+def _apply_pw3_decision(decision: Decision) -> None:
+    """Push a PW3-targeted Decision (mode + reserve) to the Fleet API.
+
+    Idempotency: read current state first, skip the write if it already
+    matches. Baseline: on first engage (no baseline saved yet), capture
+    the current state before flipping so we know what to restore to.
+    """
+    if decision.pw3_mode is None or decision.pw3_reserve_pct is None:
+        logger.warning(
+            "apply: pw3 decision missing fields ({!r}); skipping",
+            decision.reason,
+        )
+        return
+    try:
+        client = _pw3_client()
+        current = client.read_state()
+        # Save baseline before our first engage.
+        if _read_peak_baseline() is None:
+            _save_peak_baseline(current)
+        # Idempotency — skip the cloud round-trip if firmware already
+        # matches what we'd write. The tariff/mode-transition logic on
+        # the firmware sometimes re-applies state after a few minutes;
+        # checking each tick keeps us converging without spamming.
+        if (current.mode == decision.pw3_mode
+                and current.reserve_pct == decision.pw3_reserve_pct):
+            return
+        client.enable_tbc(decision.pw3_reserve_pct)
+        logger.info(
+            "apply: action={} set mode={!r} reserve={} ({})",
+            decision.action_name or "—",
+            decision.pw3_mode,
+            decision.pw3_reserve_pct,
+            decision.reason,
+        )
+    except Exception:
+        logger.exception("apply: push to PW3 cloud failed")
+
+
+def _restore_pw3_baseline_if_set() -> None:
+    """If a baseline exists, restore it and clear the file.
+
+    Called when no PeakExport decision is in effect this tick — i.e.
+    we've left the peak window (or the user disabled the action). The
+    baseline file presence is the only "did we engage?" signal we keep,
+    so once we restore we delete it so the next engage captures fresh.
+    """
+    baseline = _read_peak_baseline()
+    if baseline is None:
+        return
+    try:
+        client = _pw3_client()
+        current = client.read_state()
+        if current.mode == baseline.mode and current.reserve_pct == baseline.reserve_pct:
+            # Already restored (or user reverted manually); just clean up.
+            _clear_peak_baseline()
+            return
+        client.restore(baseline.mode, baseline.reserve_pct)
+        logger.info(
+            "peak_export: restored baseline mode={!r} reserve={}",
+            baseline.mode, baseline.reserve_pct,
+        )
+        _clear_peak_baseline()
+    except Exception:
+        logger.exception("peak_export: restore failed (will retry next tick)")
+
+
+def _apply_decision(decision: Decision) -> None:
+    """Dispatch a Decision to its target system.
+
+    `target_system="ev"` is the EVSE write path (everything we used to
+    do); `"pw3"` routes to the cloud client. `"none"` (or any other
+    value) is a no-op.
+
+    The PW3 baseline-restore that pairs with PeakExport lives in
+    `_control_tick` itself (and runs *before* dispatch), not here —
+    callers can short-circuit dispatch via the EVSE-idempotency check
+    and we don't want that to silently skip a restore.
+    """
+    if decision.target_system == "pw3":
+        _apply_pw3_decision(decision)
+    elif decision.target_system == "ev":
+        _apply_ev_decision(decision)
+    # "none" / unknown -> no-op
+
+
+def _apply_target(decision: Decision) -> None:
+    """Back-compat shim; new callers should use `_apply_decision`."""
+    _apply_decision(decision)
 
 
 def _control_tick() -> None:
@@ -451,6 +589,20 @@ def _control_tick() -> None:
     _record_sample_from_state(ctl, decision)
     _record_loads(int(time.time()))
 
+    # ALWAYS restore the PW3 baseline if we just left a peak_export
+    # window — independent of EVSE availability or EVSE-target
+    # idempotency. The previous version called restore from inside
+    # `_apply_decision`, which the dispatcher could skip when the EVSE
+    # already matched the (idle) target, stranding the PW3 in TBC.
+    if decision.action_name != "peak_export":
+        _restore_pw3_baseline_if_set()
+
+    # PW3 + "none" Decisions dispatch unconditionally — EVSE availability
+    # is irrelevant. For EV Decisions, keep the historical EVSE-state
+    # short-circuit to avoid an unnecessary Emporia round-trip.
+    if decision.target_system != "ev":
+        _apply_decision(decision)
+        return
     if ev is None:
         return
     has_rate = decision.target_amps >= settings.ev_min_amps
@@ -461,7 +613,7 @@ def _control_tick() -> None:
     else:
         if not ev.on and (not has_rate or ev.charge_rate_a == decision.target_amps):
             return
-    _apply_target(decision)
+    _apply_decision(decision)
 
 
 def _em_loads(ev_circuit_name: str) -> tuple[float | None, float | None]:
@@ -1264,11 +1416,12 @@ def _loads_foreign(consumers: list[tuple[str, float]] | None) -> str:
 def _modes_foreign(pw: PowerReading | None, ev: ChargerState | None) -> str:
     """Dashboard control panel: per-action enable toggles + kill switch.
 
-    Four buttons stacked vertically:
+    Five buttons stacked vertically:
       1. Morning Dump   — toggles `settings.morning_dump_enabled`
       2. Surplus        — toggles `settings.surplus_enabled`
       3. Solar → EV     — toggles `settings.solar_passthrough_enabled`
-      4. Disable All / Enable All — engages/releases the kill switch.
+      4. Peak Export    — toggles `settings.peak_export_enabled`
+      5. Disable All / Enable All — engages/releases the kill switch.
 
     Per-action buttons show as active only when their flag is True AND
     the kill switch is not engaged (the kill switch overrides). EVSE
@@ -1309,6 +1462,13 @@ def _modes_foreign(pw: PowerReading | None, ev: ChargerState | None) -> str:
         spt_active, ctl.kill_switch, current_action or "", "solar_passthrough",
     )
 
+    # Peak Export (PeakExport — drives the PW3, not the EV)
+    pe_enabled = bool(getattr(ctl.settings, "peak_export_enabled", False))
+    pe_active = pe_enabled and not ctl.kill_switch
+    pe_sub = _action_sub(
+        pe_active, ctl.kill_switch, current_action or "", "peak_export",
+    )
+
     # Kill switch button
     if ctl.kill_switch:
         ks_value = "release_kill_switch"
@@ -1325,6 +1485,7 @@ def _modes_foreign(pw: PowerReading | None, ev: ChargerState | None) -> str:
         _btn("toggle_morning_dump", "Morning Dump", md_sub, md_active),
         _btn("toggle_surplus", "Surplus", sp_sub, sp_active),
         _btn("toggle_solar_passthrough", "Solar → EV", spt_sub, spt_active),
+        _btn("toggle_peak_export", "Peak Export", pe_sub, pe_active),
         _btn(ks_value, ks_label, ks_sub, ks_active),
     ]
     x, y, w, h = _MODES_PANEL
@@ -1751,8 +1912,8 @@ def set_mode(action: Annotated[str, Form()]) -> RedirectResponse:
 
     `action` is one of:
       - "toggle_morning_dump" / "toggle_surplus" /
-        "toggle_solar_passthrough" — flip the matching Settings flag
-        in place (in-memory only; not persisted).
+        "toggle_solar_passthrough" / "toggle_peak_export" — flip the
+        matching Settings flag in place (in-memory only; not persisted).
       - "engage_kill_switch" / "release_kill_switch" — kill switch.
 
     The next `_control_tick` picks up the change naturally — no need
@@ -1771,6 +1932,10 @@ def set_mode(action: Annotated[str, Form()]) -> RedirectResponse:
         new_state = not bool(getattr(ctl.settings, "solar_passthrough_enabled", False))
         ctl.settings.solar_passthrough_enabled = new_state
         logger.info("solar_passthrough_enabled -> {} (user)", new_state)
+    elif action == "toggle_peak_export":
+        new_state = not bool(getattr(ctl.settings, "peak_export_enabled", False))
+        ctl.settings.peak_export_enabled = new_state
+        logger.info("peak_export_enabled -> {} (user)", new_state)
     elif action == "engage_kill_switch":
         ctl.engage_kill_switch()
         logger.info("automation disabled by user (kill switch engaged)")

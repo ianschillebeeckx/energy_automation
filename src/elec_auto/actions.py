@@ -291,6 +291,90 @@ class MorningDump:
         return s.morning_dump_floor_pct
 
 
+# --- PeakExport ---------------------------------------------------------------
+
+# Months and day-types we want the action to fire on. Derived from PG&E
+# NBT 2026 EEC Delivered rates (data/tariff/PGE_NBT26_EEC_Values_2026_long.csv)
+# crossed with a custom Tesla tariff the user uploads via the app — the
+# only hours where (delivery credit + custom-tariff arbitrage) are worth
+# the battery cycle.
+PEAK_DAYS_BY_MONTH: dict[int, set[str]] = {
+    6: {"weekday"},                # June weekday only
+    7: {"weekday"},                # July weekday only
+    8: {"weekday", "weekend"},     # August any day
+}
+
+
+def _today_is_peak_day(now) -> bool:
+    """True iff (now.month, weekday/weekend) is in PEAK_DAYS_BY_MONTH."""
+    rules = PEAK_DAYS_BY_MONTH.get(now.month)
+    if not rules:
+        return False
+    daytype = "weekday" if now.weekday() < 5 else "weekend"
+    return daytype in rules
+
+
+class PeakExport:
+    """Discharge the Powerwall to the grid during the evening peak hour.
+
+    Drives the *Powerwall*, not the EV. Sets mode=autonomous (TBC) and
+    lowers reserve to `peak_export_floor_pct`. The actual buy/sell
+    arbitrage that triggers discharge lives in the custom Tesla tariff
+    the user uploaded (e.g. "Force Discharge" with sell ON_PEAK =
+    $1/kWh). We just make sure the firmware is in TBC at the right
+    moment with enough headroom above the reserve to dispatch.
+
+    Timing: engage at the start of the peak window and let the firmware
+    do the rest. Tesla auto-throttles the discharge rate based on
+    `(soc - reserve) / time_remaining_in_ON_PEAK`, so an earlier
+    "late-as-possible" sizing pass we originally wrote was redundant —
+    the firmware handles rate-shaping internally and stops cleanly at
+    the reserve regardless of when we flip mode.
+
+    Partitioning: priority 50 (highest in the roster). If MorningDump
+    (40), Surplus (20), or SolarPassthrough (25) somehow apply at the
+    same time, PeakExport wins. In practice the peak window is evening
+    while the others are morning/daytime, so overlap is unlikely.
+    """
+
+    name = "peak_export"
+    priority = 50
+    enabled_setting = "peak_export_enabled"
+
+    def applies(self, state: State, ctx: ActionContext) -> bool:
+        if state.soc_pct is None:
+            return False
+        s = ctx.settings
+        if not _today_is_peak_day(ctx.now):
+            return False
+        if state.soc_pct <= s.peak_export_floor_pct:
+            return False
+        start_time = ctx.now.replace(
+            hour=s.peak_export_start_hour, minute=0, second=0, microsecond=0,
+        )
+        end_time = ctx.now.replace(
+            hour=s.peak_export_end_hour, minute=0, second=0, microsecond=0,
+        )
+        return start_time <= ctx.now < end_time
+
+    def decide(self, state: State, ctx: ActionContext) -> Decision:
+        s = ctx.settings
+        soc = state.soc_pct or 0.0
+        drain_kwh = max(0.0, (soc - s.peak_export_floor_pct) / 100.0 * s.battery_capacity_kwh)
+        reason = (
+            f"peak export {s.peak_export_start_hour:02d}-{s.peak_export_end_hour:02d} "
+            f"(SoC {soc:.0f}% → {s.peak_export_floor_pct}%, ~{drain_kwh:.1f} kWh budget)"
+        )
+        return Decision(
+            target_amps=0,
+            reason=reason,
+            on=False,
+            target_system="pw3",
+            pw3_mode="autonomous",
+            pw3_reserve_pct=s.peak_export_floor_pct,
+        )
+
+
 # Default action roster. Order doesn't matter (priority decides winners),
 # but listing high-priority first reads naturally.
 #
@@ -298,6 +382,7 @@ class MorningDump:
 # in the new world — the user disables automation entirely via the
 # Controller's kill_switch and sets EVSE amperage from the Emporia app.
 DEFAULT_ACTIONS: list[Action] = [
+    PeakExport(),
     MorningDump(),
     SolarPassthrough(),
     Surplus(),
