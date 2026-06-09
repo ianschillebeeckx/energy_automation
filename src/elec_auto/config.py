@@ -47,12 +47,18 @@ class Settings(BaseSettings):
     ev_max_amps: int = Field(default=40, ge=6)
     ev_voltage: int = 240
 
-    # Per-action enable flags. The two actions are independently
-    # toggleable. Disabling automation entirely is the Controller's
-    # `kill_switch`, which is orthogonal to these flags; with the kill
-    # switch engaged neither action runs even if the flag is True.
+    # Per-action enable flags. The actions are independently toggleable.
+    # Disabling automation entirely is the Controller's `kill_switch`,
+    # which is orthogonal to these flags; with the kill switch engaged
+    # no action runs even if its flag is True.
     surplus_enabled: bool = True
     morning_dump_enabled: bool = True
+    # SolarPassthrough is off by default — it's a manual override the
+    # user opts into when they want EV-over-battery priority (e.g. low
+    # SoC morning, but the day's plan needs the car charged). When on,
+    # it partitions cleanly with Surplus by SoC: SolarPassthrough fires
+    # below the reserve, Surplus above it.
+    solar_passthrough_enabled: bool = False
 
     # Powerwall usable capacity (kWh). One PW3 unit is 13.5 kWh; override
     # in .env if the site has more. Used by the morning-dump calculator.

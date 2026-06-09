@@ -14,7 +14,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from elec_auto.actions import (
-    DEFAULT_ACTIONS, ActionContext, MorningDump, Surplus,
+    DEFAULT_ACTIONS, ActionContext, MorningDump, SolarPassthrough, Surplus,
 )
 from elec_auto.config import Settings
 from elec_auto.samples import Forecast, LoadStore, Sample, SampleStore
@@ -453,9 +453,68 @@ def test_morning_dump_decide_clamps_to_max_amps() -> None:
     assert d.on is True
 
 
+# --- SolarPassthrough --------------------------------------------------------
+
+
+def test_solar_passthrough_applies_below_reserve_with_solar() -> None:
+    """SolarPassthrough fires where Surplus does NOT — below the reserve."""
+    a = SolarPassthrough()
+    st = _state(soc=40, solar=4000, load=800)
+    assert a.applies(st, _ctx()) is True
+
+
+def test_solar_passthrough_partitions_with_surplus_at_reserve() -> None:
+    """At/above the reserve, SolarPassthrough yields to Surplus."""
+    a = SolarPassthrough()
+    s = _settings(battery_reserve_pct=80)
+    st = _state(soc=80, solar=4000, load=800)
+    assert a.applies(st, _ctx(settings=s)) is False
+    st_above = _state(soc=95, solar=4000, load=800)
+    assert a.applies(st_above, _ctx(settings=s)) is False
+
+
+def test_solar_passthrough_applies_false_without_solar() -> None:
+    a = SolarPassthrough()
+    st = _state(soc=40, solar=0, load=800)
+    assert a.applies(st, _ctx()) is False
+
+
+def test_solar_passthrough_applies_inside_dump_window() -> None:
+    """Unlike Surplus, SolarPassthrough fires in the dump window —
+    MorningDump's priority (40) handles the tiebreak when both apply,
+    and disabling MorningDump leaves SolarPassthrough free to run."""
+    a = SolarPassthrough()
+    st = _state(soc=40, solar=4000, load=800)
+    ctx = _ctx(
+        dump_start=_T0 - timedelta(hours=1),
+        dump_end=_T0 + timedelta(hours=1),
+    )
+    assert ctx.in_dump_window is True
+    assert a.applies(st, ctx) is True
+
+
+def test_solar_passthrough_decide_matches_surplus_math() -> None:
+    """The point of the shared `_surplus_w` helper: same in, same out."""
+    state = _state(soc=40, solar=5000, load=1200)
+    ctx = _ctx()
+    sp_decision = SolarPassthrough().decide(state, ctx)
+    su_decision = Surplus().decide(state, ctx)
+    assert sp_decision.target_amps == su_decision.target_amps
+    assert sp_decision.on == su_decision.on
+
+
+def test_solar_passthrough_decide_below_min_returns_zero_off() -> None:
+    a = SolarPassthrough()
+    # Solar barely covers home load — surplus < ev_min_amps × ev_voltage.
+    st = _state(soc=40, solar=1200, load=1100)
+    d = a.decide(st, _ctx())
+    assert d.target_amps == 0
+    assert d.on is False
+
+
 # --- DEFAULT_ACTIONS roster --------------------------------------------------
 
 
-def test_default_actions_contains_two_known_actions() -> None:
+def test_default_actions_contains_known_actions() -> None:
     names = {type(a).__name__ for a in DEFAULT_ACTIONS}
-    assert names == {"MorningDump", "Surplus"}
+    assert names == {"MorningDump", "SolarPassthrough", "Surplus"}

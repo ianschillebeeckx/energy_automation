@@ -74,6 +74,44 @@ class Action(Protocol):
     def decide(self, state: State, ctx: ActionContext) -> Decision: ...
 
 
+# --- shared helpers ----------------------------------------------------------
+
+
+def _surplus_w(state: State, ctx: ActionContext) -> float:
+    """Solar minus (non-EV load), in watts. Negative when load > solar.
+
+    "Non-EV load" subtracts the EV's own draw so we don't think it's
+    home consumption. The EV self-draw source depends on EVSE status:
+
+      "Charging": use the configured rate × voltage. Tracks real draw
+        within a few %, and crucially it's *instantaneous* — the same
+        time-base as pw.load_w. The measured Emporia `ev_circuit_w` is
+        a 1-minute rolling cloud average (`Scale.MINUTE` in emporia.py),
+        so subtracting it from an instantaneous PW3 load produced a
+        phantom non-EV load each time a charging session started, which
+        made Surplus bounce ON→OFF on a ~1 min cycle.
+
+      anything else: trust the measured Emporia value. In Standby /
+        Disconnected the EVSE is configured at some rate but the
+        contactor is open and the car draws ~0, so the configured
+        proxy would phantom-add kW of "EV draw."
+
+      no Emporia reading and not Charging: legacy proxy fallback for
+        first-tick / test paths where Emporia hasn't reported yet.
+    """
+    s = ctx.settings
+    if state.ev_on and state.ev_status == "Charging":
+        ev_w_now: float = (state.ev_amps or 0) * s.ev_voltage
+    elif state.ev_circuit_w is not None:
+        ev_w_now = state.ev_circuit_w
+    elif state.ev_on:
+        ev_w_now = (state.ev_amps or 0) * s.ev_voltage
+    else:
+        ev_w_now = 0.0
+    non_ev_load_w = (state.load_w or 0) - ev_w_now
+    return (state.solar_w or 0) - non_ev_load_w
+
+
 # --- concrete actions --------------------------------------------------------
 
 
@@ -102,37 +140,7 @@ class Surplus:
 
     def decide(self, state: State, ctx: ActionContext) -> Decision:
         s = ctx.settings
-        # EV self-draw estimate, subtracted from load_w to get the
-        # "true" non-EV load. Source depends on EVSE status:
-        #
-        #   "Charging": use the configured rate × voltage. Tracks real
-        #     draw within a few %, and crucially it's *instantaneous* —
-        #     the same time-base as pw.load_w. The measured Emporia
-        #     `ev_circuit_w` is a 1-minute rolling cloud average
-        #     (`Scale.MINUTE` in emporia.py), so subtracting it from an
-        #     instantaneous PW3 load produced a phantom non-EV load
-        #     each time a charging session started, which made Surplus
-        #     bounce ON→OFF on a ~1 min cycle.
-        #
-        #   anything else: trust the measured Emporia value. In
-        #     Standby/Disconnected the EVSE is configured at some rate
-        #     but the contactor is open and the car draws ~0, so the
-        #     configured proxy would phantom-add kW of "EV draw".
-        #
-        #   no Emporia reading and not Charging: legacy proxy
-        #     fallback for first-tick / test paths where Emporia hasn't
-        #     reported yet.
-        if state.ev_on and state.ev_status == "Charging":
-            ev_w_now = (state.ev_amps or 0) * s.ev_voltage
-        elif state.ev_circuit_w is not None:
-            ev_w_now = state.ev_circuit_w
-        elif state.ev_on:
-            ev_w_now = (state.ev_amps or 0) * s.ev_voltage
-        else:
-            ev_w_now = 0
-        non_ev_load_w = (state.load_w or 0) - ev_w_now
-        surplus_w = (state.solar_w or 0) - non_ev_load_w
-
+        surplus_w = _surplus_w(state, ctx)
         target_amps = int(surplus_w // s.ev_voltage)
         if target_amps < s.ev_min_amps:
             return Decision(
@@ -141,6 +149,57 @@ class Surplus:
         target_amps = min(target_amps, s.ev_max_amps)
         return Decision(
             target_amps, f"surplus {surplus_w:.0f}W -> {target_amps}A", on=True,
+        )
+
+
+class SolarPassthrough:
+    """Charge EV from solar without draining (or filling) the battery.
+
+    Same math as Surplus — set EV draw to (solar − non-EV load) so the
+    battery stays roughly flat. The difference is *when* it fires:
+    Surplus waits for the battery to reach `battery_reserve_pct` first;
+    SolarPassthrough fires below that threshold. Useful when the user
+    wants EV-over-battery priority (e.g. low SoC morning, but the
+    day's plan needs the car charged).
+
+    Partitioning:
+      - With Surplus: cleanly by SoC. Surplus covers ≥ reserve_pct,
+        SolarPassthrough covers < reserve_pct. They can't both apply.
+      - With MorningDump: by priority, not predicate. MorningDump
+        (priority 40) wins in the dump window when both apply. When
+        MorningDump is disabled, SolarPassthrough fires there too —
+        that's the intended override path.
+    """
+
+    name = "solar_passthrough"
+    priority = 25
+    enabled_setting = "solar_passthrough_enabled"
+
+    def applies(self, state: State, ctx: ActionContext) -> bool:
+        if state.soc_pct is None or state.solar_w is None or state.load_w is None:
+            return False
+        # Partition with Surplus: it owns the "battery full" half.
+        if state.soc_pct >= ctx.settings.battery_reserve_pct:
+            return False
+        if state.solar_w <= 0:
+            return False
+        return True
+
+    def decide(self, state: State, ctx: ActionContext) -> Decision:
+        s = ctx.settings
+        surplus_w = _surplus_w(state, ctx)
+        target_amps = int(surplus_w // s.ev_voltage)
+        if target_amps < s.ev_min_amps:
+            return Decision(
+                0,
+                f"solar passthrough {surplus_w:.0f}W < min {s.ev_min_amps}A",
+                on=False,
+            )
+        target_amps = min(target_amps, s.ev_max_amps)
+        return Decision(
+            target_amps,
+            f"solar passthrough {surplus_w:.0f}W -> {target_amps}A",
+            on=True,
         )
 
 
@@ -240,5 +299,6 @@ class MorningDump:
 # Controller's kill_switch and sets EVSE amperage from the Emporia app.
 DEFAULT_ACTIONS: list[Action] = [
     MorningDump(),
+    SolarPassthrough(),
     Surplus(),
 ]

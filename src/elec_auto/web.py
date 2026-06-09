@@ -146,6 +146,8 @@ def _mode_label(ctl: Controller) -> str:
         return "Starting…"
     if d.action_name == "surplus":
         return "Surplus solar"
+    if d.action_name == "solar_passthrough":
+        return "Solar → EV"
     if d.action_name == "morning_dump":
         return "Morning dump"
     if d.action_name == "kill_switch":
@@ -1262,10 +1264,11 @@ def _loads_foreign(consumers: list[tuple[str, float]] | None) -> str:
 def _modes_foreign(pw: PowerReading | None, ev: ChargerState | None) -> str:
     """Dashboard control panel: per-action enable toggles + kill switch.
 
-    Three buttons stacked vertically:
-      1. Morning Dump — toggles `settings.morning_dump_enabled`
-      2. Surplus      — toggles `settings.surplus_enabled`
-      3. Disable All / Enable All — engages/releases the kill switch.
+    Four buttons stacked vertically:
+      1. Morning Dump   — toggles `settings.morning_dump_enabled`
+      2. Surplus        — toggles `settings.surplus_enabled`
+      3. Solar → EV     — toggles `settings.solar_passthrough_enabled`
+      4. Disable All / Enable All — engages/releases the kill switch.
 
     Per-action buttons show as active only when their flag is True AND
     the kill switch is not engaged (the kill switch overrides). EVSE
@@ -1282,27 +1285,29 @@ def _modes_foreign(pw: PowerReading | None, ev: ChargerState | None) -> str:
             f'{label}<small>{sub}</small></button>'
         )
 
+    def _action_sub(active: bool, kill: bool, current: str, name: str) -> str:
+        """Subtitle text for an action button. Single source of truth for
+        the four states: firing / enabled-idle / kill-overridden / disabled."""
+        if active:
+            return "firing" if current == name else "enabled / idle"
+        return "kill switch on" if kill else "disabled"
+
     # Morning Dump
     md_enabled = bool(getattr(ctl.settings, "morning_dump_enabled", True))
     md_active = md_enabled and not ctl.kill_switch
-    if md_active:
-        md_sub = "firing" if current_action == "morning_dump" else "enabled / idle"
-    else:
-        if ctl.kill_switch:
-            md_sub = "kill switch on"
-        else:
-            md_sub = "disabled"
+    md_sub = _action_sub(md_active, ctl.kill_switch, current_action or "", "morning_dump")
 
     # Surplus
     sp_enabled = bool(getattr(ctl.settings, "surplus_enabled", True))
     sp_active = sp_enabled and not ctl.kill_switch
-    if sp_active:
-        sp_sub = "firing" if current_action == "surplus" else "enabled / idle"
-    else:
-        if ctl.kill_switch:
-            sp_sub = "kill switch on"
-        else:
-            sp_sub = "disabled"
+    sp_sub = _action_sub(sp_active, ctl.kill_switch, current_action or "", "surplus")
+
+    # Solar → EV (SolarPassthrough)
+    spt_enabled = bool(getattr(ctl.settings, "solar_passthrough_enabled", False))
+    spt_active = spt_enabled and not ctl.kill_switch
+    spt_sub = _action_sub(
+        spt_active, ctl.kill_switch, current_action or "", "solar_passthrough",
+    )
 
     # Kill switch button
     if ctl.kill_switch:
@@ -1319,6 +1324,7 @@ def _modes_foreign(pw: PowerReading | None, ev: ChargerState | None) -> str:
     rows = [
         _btn("toggle_morning_dump", "Morning Dump", md_sub, md_active),
         _btn("toggle_surplus", "Surplus", sp_sub, sp_active),
+        _btn("toggle_solar_passthrough", "Solar → EV", spt_sub, spt_active),
         _btn(ks_value, ks_label, ks_sub, ks_active),
     ]
     x, y, w, h = _MODES_PANEL
@@ -1744,8 +1750,9 @@ def set_mode(action: Annotated[str, Form()]) -> RedirectResponse:
     """Per-action enable toggles + kill switch.
 
     `action` is one of:
-      - "toggle_morning_dump" / "toggle_surplus" — flip the matching
-        Settings flag in place (in-memory only; not persisted).
+      - "toggle_morning_dump" / "toggle_surplus" /
+        "toggle_solar_passthrough" — flip the matching Settings flag
+        in place (in-memory only; not persisted).
       - "engage_kill_switch" / "release_kill_switch" — kill switch.
 
     The next `_control_tick` picks up the change naturally — no need
@@ -1760,6 +1767,10 @@ def set_mode(action: Annotated[str, Form()]) -> RedirectResponse:
         new_state = not bool(getattr(ctl.settings, "surplus_enabled", True))
         ctl.settings.surplus_enabled = new_state
         logger.info("surplus_enabled -> {} (user)", new_state)
+    elif action == "toggle_solar_passthrough":
+        new_state = not bool(getattr(ctl.settings, "solar_passthrough_enabled", False))
+        ctl.settings.solar_passthrough_enabled = new_state
+        logger.info("solar_passthrough_enabled -> {} (user)", new_state)
     elif action == "engage_kill_switch":
         ctl.engage_kill_switch()
         logger.info("automation disabled by user (kill switch engaged)")
