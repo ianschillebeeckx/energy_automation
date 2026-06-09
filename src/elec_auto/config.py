@@ -38,10 +38,48 @@ class Settings(BaseSettings):
 
     # Control loop
     poll_interval_sec: int = 30
+    # How long a telemetry reading stays "fresh" for ControlState's
+    # load_w preference logic. A PW3 reading older than this falls back
+    # to an Emporia reading if Emporia is fresher (and vice versa).
+    telemetry_fresh_sec: int = Field(default=60, ge=10, le=600)
     battery_reserve_pct: int = Field(default=80, ge=0, le=100)
     ev_min_amps: int = Field(default=6, ge=6)
     ev_max_amps: int = Field(default=40, ge=6)
     ev_voltage: int = 240
+
+    # Per-action enable flags. The actions are independently toggleable.
+    # Disabling automation entirely is the Controller's `kill_switch`,
+    # which is orthogonal to these flags; with the kill switch engaged
+    # no action runs even if its flag is True.
+    surplus_enabled: bool = True
+    morning_dump_enabled: bool = True
+    # SolarPassthrough is off by default — it's a manual override the
+    # user opts into when they want EV-over-battery priority (e.g. low
+    # SoC morning, but the day's plan needs the car charged). When on,
+    # it partitions cleanly with Surplus by SoC: SolarPassthrough fires
+    # below the reserve, Surplus above it.
+    solar_passthrough_enabled: bool = False
+    # PeakExport drives the *Powerwall* (not the EV) — flips to TBC and
+    # lowers the reserve so the firmware dispatches battery → grid during
+    # the evening peak window. The buy/sell math that actually triggers
+    # discharge lives in a custom tariff the user uploads via the Tesla
+    # app (e.g. "Force Discharge June" with sell ON_PEAK = $1/kWh); this
+    # action just makes sure mode + reserve are set so the firmware can
+    # act on that tariff.
+    peak_export_enabled: bool = False
+    # SoC we want the battery to land on at end-of-discharge. Tesla's
+    # firmware auto-throttles discharge to land here exactly at the end
+    # of its custom-tariff ON_PEAK window, so this doubles as the
+    # discharge target *and* the cutoff.
+    peak_export_floor_pct: int = Field(default=40, ge=10, le=90)
+    # Peak window (local time, 24h). Must align with the user's custom
+    # Tesla tariff ON_PEAK block; the firmware obeys its own tariff for
+    # the actual buy/sell math, we just flip mode at start_hour and
+    # restore at end_hour. Earlier "late as possible" sizing was
+    # redundant — Tesla rate-shapes discharge based on
+    # (soc − reserve) / time_remaining_in_ON_PEAK.
+    peak_export_start_hour: int = Field(default=19, ge=0, le=23)
+    peak_export_end_hour: int = Field(default=20, ge=0, le=23)
 
     # Powerwall usable capacity (kWh). One PW3 unit is 13.5 kWh; override
     # in .env if the site has more. Used by the morning-dump calculator.
@@ -56,6 +94,14 @@ class Settings(BaseSettings):
     #     displayed = max(0, (raw - floor) / (100 - floor) * 100)
     # If Tesla ever changes this on PW3 firmware, adjust here.
     battery_raw_floor_pct: float = Field(default=5.0, ge=5.0, le=20.0)
+    # Continuous DC draw from the cells for gateway, BMS, thermal
+    # management, and cell balancing. Never crosses the inverter so it
+    # doesn't appear in AC `battery_w` — but it drains real SoC. Used
+    # by `state.step()`'s dead-reckoning branch as a constant added to
+    # the AC-balance battery_w_est. Fit empirically on 2026-05-18:
+    # AC integration of recorded battery_w underpredicted SoC drop by
+    # ~66 W average over a 2-hour outage window.
+    battery_vampire_w: float = Field(default=66.0, ge=0.0, le=500.0)
     # Morning-dump window: starts at `start_hour` and runs for `hours`.
     # Default 06:00 + 2 h spreads the dump across two hours so the per-tick
     # amperage is roughly halved vs a 1 h window — gentler on the EVSE,

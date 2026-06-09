@@ -22,13 +22,37 @@ from .powerwall import PowerReading
 
 @dataclass(slots=True)
 class Decision:
+    """A control-loop verdict: rate to configure and whether to actually charge.
+
+    `on` defaults to False so that any Decision constructed without an
+    explicit `on=` is fail-safe (the EVSE stays paused). The previous
+    True default once let a stray ``Decision(0, "waiting on telemetry")``
+    start the charger at its last-configured rate; the flipped default
+    makes "I didn't say on, so don't turn on" the natural read.
+    """
+
     target_amps: int
     reason: str
     # Whether the EVSE should be charging *right now*. When False, target_amps
     # still carries the rate the controller thinks the charger should be
     # configured at (e.g. the preview for a scheduled mode), so the dashboard
     # shows something meaningful while the breaker is paused.
-    on: bool = True
+    on: bool = False
+    # Which action produced this Decision. Filled by `Controller.tick()`
+    # from the winning action's `name`. "" for kill-switch / "no action
+    # applies" / direct policy.decide_ev_amps() callers.
+    action_name: str = ""
+    # Which downstream system this Decision targets. Default "ev" keeps
+    # the existing EV-shaped fields meaningful; "pw3" means dispatch this
+    # one to the Powerwall cloud client (pw3_cloud.py) instead, in which
+    # case `target_amps`/`on` are ignored and the pw3_* fields below
+    # carry the instructions. "none" is a no-op Decision (kill-switch /
+    # "no action applies"). Adding new targets here is the extension
+    # point for "control X via the controller pipeline."
+    target_system: str = "ev"            # "ev" | "pw3" | "none"
+    # PW3-specific instructions, only meaningful when target_system == "pw3".
+    pw3_mode: str | None = None          # "autonomous" | "self_consumption" | "backup"
+    pw3_reserve_pct: int | None = None
 
 
 def decide_ev_amps(

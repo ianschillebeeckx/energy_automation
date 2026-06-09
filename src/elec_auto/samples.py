@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS samples (
     charger_amps    INTEGER,
     charger_on      INTEGER,
     charger_status  TEXT,
+    action_name     TEXT,
     pw_ok           INTEGER,
     em_ok           INTEGER,
     mode            TEXT,
@@ -59,6 +60,7 @@ CREATE TABLE IF NOT EXISTS forecasts (
     PRIMARY KEY (period_ts, fetched_at, source)
 );
 CREATE INDEX IF NOT EXISTS idx_forecasts_period ON forecasts(period_ts);
+CREATE INDEX IF NOT EXISTS idx_forecasts_source_fetched ON forecasts(source, fetched_at);
 CREATE TABLE IF NOT EXISTS weather (
     period_ts        INTEGER NOT NULL,
     fetched_at       INTEGER NOT NULL,
@@ -109,6 +111,7 @@ _SAMPLES_MIGRATIONS: list[tuple[str, str]] = [
     ("decision_on", "INTEGER"),
     ("decision_reason", "TEXT"),
     ("charger_status", "TEXT"),
+    ("action_name", "TEXT"),
 ]
 
 
@@ -143,6 +146,7 @@ class Sample:
     charger_amps: int | None = None
     charger_on: bool | None = None
     charger_status: str | None = None  # Emporia EVSE status (e.g. "Charging")
+    action_name: str | None = None     # Which Action fired this tick (e.g. "surplus")
     pw_ok: bool | None = None
     em_ok: bool | None = None
     mode: str | None = None
@@ -197,8 +201,9 @@ class SampleStore:
                 INSERT OR REPLACE INTO samples
                 (ts, solar_w, load_w, battery_w, grid_w, soc_pct,
                  theoretical_w, charger_amps, charger_on, charger_status,
+                 action_name,
                  pw_ok, em_ok, mode, decision_amps, decision_on, decision_reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     sample.ts, sample.solar_w, sample.load_w, sample.battery_w,
@@ -206,6 +211,7 @@ class SampleStore:
                     sample.charger_amps,
                     _bool(sample.charger_on),
                     sample.charger_status,
+                    sample.action_name,
                     _bool(sample.pw_ok), _bool(sample.em_ok), sample.mode,
                     sample.decision_amps, _bool(sample.decision_on),
                     sample.decision_reason,
@@ -233,6 +239,7 @@ class SampleStore:
                 """
                 SELECT ts, solar_w, load_w, battery_w, grid_w, soc_pct,
                        theoretical_w, charger_amps, charger_on, charger_status,
+                       action_name,
                        pw_ok, em_ok, mode, decision_amps, decision_on,
                        decision_reason
                 FROM samples WHERE ts BETWEEN ? AND ? ORDER BY ts
@@ -248,10 +255,10 @@ class SampleStore:
                 ts=r[0], solar_w=r[1], load_w=r[2], battery_w=r[3], grid_w=r[4],
                 soc_pct=r[5], theoretical_w=r[6],
                 charger_amps=r[7], charger_on=_opt_bool(r[8]),
-                charger_status=r[9],
-                pw_ok=_opt_bool(r[10]), em_ok=_opt_bool(r[11]), mode=r[12],
-                decision_amps=r[13], decision_on=_opt_bool(r[14]),
-                decision_reason=r[15],
+                charger_status=r[9], action_name=r[10],
+                pw_ok=_opt_bool(r[11]), em_ok=_opt_bool(r[12]), mode=r[13],
+                decision_amps=r[14], decision_on=_opt_bool(r[15]),
+                decision_reason=r[16],
             )
             for r in rows
         ]
@@ -308,21 +315,34 @@ class ForecastStore:
         contains `fetched_at` — i.e. "what did Solcast predict for the
         moment we made the call?". Useful for placing markers on the
         chart's forecast line.
+
+        Implementation note: the prior version used a correlated
+        subquery (`period_ts = (SELECT ... ORDER BY ABS(...) LIMIT 1)`)
+        which forced a full table scan per outer row — ~3.6 s on a
+        27 k-row table and the dominant cost of the dashboard's first-
+        byte time. ROW_NUMBER() over a partition does the same in one
+        pass, and the new `idx_forecasts_source_fetched` index narrows
+        the outer scan.
         """
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT f.fetched_at, f.pv_w_p50
-                FROM forecasts f
-                WHERE f.source = ?
-                  AND f.fetched_at BETWEEN ? AND ?
-                  AND f.period_ts = (
-                      SELECT period_ts FROM forecasts f2
-                      WHERE f2.source = f.source AND f2.fetched_at = f.fetched_at
-                      ORDER BY ABS(f2.period_ts - f2.fetched_at)
-                      LIMIT 1
-                  )
-                ORDER BY f.fetched_at
+                WITH ranked AS (
+                    SELECT
+                        fetched_at,
+                        pv_w_p50,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY source, fetched_at
+                            ORDER BY ABS(period_ts - fetched_at)
+                        ) AS rn
+                    FROM forecasts
+                    WHERE source = ?
+                      AND fetched_at BETWEEN ? AND ?
+                )
+                SELECT fetched_at, pv_w_p50
+                FROM ranked
+                WHERE rn = 1
+                ORDER BY fetched_at
                 """,
                 (source, start_ts, end_ts),
             ).fetchall()

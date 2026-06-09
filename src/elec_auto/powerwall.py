@@ -43,6 +43,17 @@ def _to_displayed_soc(raw_pct: float, raw_floor_pct: float) -> float:
     return max(0.0, min(100.0, scaled))
 
 
+class PowerwallUnavailable(RuntimeError):
+    """The gateway is in back-off after recent consecutive failures.
+
+    Raised by `_LocalGateway.read()` when we're inside the cooldown window
+    that follows a streak of failed reads. Carries no new diagnostic info
+    — the originating failure was already logged when it happened — so
+    callers should suppress this silently rather than re-logging every
+    tick during the outage.
+    """
+
+
 @dataclass(slots=True)
 class PowerReading:
     """Instantaneous power balance. Units: watts; percent for SoC.
@@ -62,10 +73,30 @@ class PowerReading:
 
 
 class _LocalGateway:
-    """Direct PW3 Gateway customer-API client."""
+    """Direct PW3 Gateway customer-API client.
+
+    Tracks consecutive failures and enters an exponential back-off so a
+    flaky or rebooting gateway isn't hammered every poll tick. After a
+    short streak we also drop the cached bearer token and recycle the
+    `requests.Session` — covers the common case where the gateway
+    rebooted and our pooled TCP socket / cached token are stale.
+
+    The back-off here subsumes the older 429-only login cooldown:
+    whether the failure is a 429, a 5xx, or a timeout, the next attempt
+    waits the same way. Per the discussion notes, honoring `Retry-After`
+    would add little — PW3 rarely sends a meaningful one.
+    """
 
     _TOKEN_REFRESH_SEC = 1800.0
-    _RATELIMIT_COOLDOWN_SEC = 300.0  # back off 5 min on 429 to avoid amplifying it
+
+    # Back-off schedule applied on consecutive read failures. Index i is
+    # used after (i+1) failures; tail value caps the wait. Keeps polling
+    # responsive after a single blip while making sustained outages cheap.
+    _BACKOFF_SCHEDULE_SEC: tuple[float, ...] = (30.0, 60.0, 120.0, 300.0)
+    # After this many failures in a row, drop the cached token + Session
+    # — the gateway likely rebooted (stale token) or our pooled socket is
+    # half-closed.
+    _RESET_STREAK = 3
 
     def __init__(self, host: str, customer_password: str, raw_floor_pct: float,
                  timeout: float = 8.0) -> None:
@@ -77,11 +108,14 @@ class _LocalGateway:
         self._session.verify = False
         self._token: str | None = None
         self._token_t = 0.0
-        self._cooldown_until = 0.0
+        # Failure tracking. `_failure_streak` is the count of consecutive
+        # failed read() calls; reset to 0 on a successful read.
+        # `_backoff_until` is a monotonic-clock deadline before which
+        # read() short-circuits with PowerwallUnavailable.
+        self._failure_streak = 0
+        self._backoff_until = 0.0
 
     def _login(self) -> None:
-        if time.monotonic() < self._cooldown_until:
-            raise RuntimeError("gateway login in cooldown after rate-limit")
         r = self._session.post(
             f"https://{self._host}/api/login/Basic",
             json={
@@ -92,9 +126,6 @@ class _LocalGateway:
             },
             timeout=self._timeout,
         )
-        if r.status_code == 429:
-            self._cooldown_until = time.monotonic() + self._RATELIMIT_COOLDOWN_SEC
-            raise RuntimeError("gateway rate-limited login (429), cooling down 5 min")
         r.raise_for_status()
         self._token = r.json()["token"]
         self._token_t = time.monotonic()
@@ -112,16 +143,49 @@ class _LocalGateway:
         return r.json()
 
     def read(self) -> PowerReading:
-        aggs = self._get("/api/meters/aggregates")
-        soe = self._get("/api/system_status/soe")
-        raw_pct = float(soe.get("percentage", float("nan")))
-        return PowerReading(
-            solar_w=float(aggs.get("solar", {}).get("instant_power", 0.0)),
-            load_w=float(aggs.get("load", {}).get("instant_power", 0.0)),
-            battery_w=float(aggs.get("battery", {}).get("instant_power", 0.0)),
-            grid_w=float(aggs.get("site", {}).get("instant_power", 0.0)),
-            battery_soc_pct=_to_displayed_soc(raw_pct, self._raw_floor_pct),
-        )
+        now_mono = time.monotonic()
+        if now_mono < self._backoff_until:
+            # Inside the back-off window — don't touch the network.
+            raise PowerwallUnavailable(
+                f"in back-off after {self._failure_streak} failure(s), "
+                f"{self._backoff_until - now_mono:.0f}s remaining",
+            )
+        try:
+            aggs = self._get("/api/meters/aggregates")
+            soe = self._get("/api/system_status/soe")
+            raw_pct = float(soe.get("percentage", float("nan")))
+            reading = PowerReading(
+                solar_w=float(aggs.get("solar", {}).get("instant_power", 0.0)),
+                load_w=float(aggs.get("load", {}).get("instant_power", 0.0)),
+                battery_w=float(aggs.get("battery", {}).get("instant_power", 0.0)),
+                grid_w=float(aggs.get("site", {}).get("instant_power", 0.0)),
+                battery_soc_pct=_to_displayed_soc(raw_pct, self._raw_floor_pct),
+            )
+        except Exception:
+            self._note_failure()
+            raise
+        # Success — clear back-off state.
+        self._failure_streak = 0
+        self._backoff_until = 0.0
+        return reading
+
+    def _note_failure(self) -> None:
+        """Bump the streak, extend back-off, and recycle session at threshold."""
+        self._failure_streak += 1
+        idx = min(self._failure_streak - 1, len(self._BACKOFF_SCHEDULE_SEC) - 1)
+        self._backoff_until = time.monotonic() + self._BACKOFF_SCHEDULE_SEC[idx]
+        if self._failure_streak == self._RESET_STREAK:
+            # Token may be stale (gateway reboot) and the pooled TCP
+            # socket may be half-closed; drop both so the next attempt
+            # starts clean. Idempotent w.r.t. higher streaks — only need
+            # to do this once, on the threshold crossing.
+            self._token = None
+            try:
+                self._session.close()
+            except Exception:
+                pass
+            self._session = requests.Session()
+            self._session.verify = False
 
 
 class _CloudGateway:
