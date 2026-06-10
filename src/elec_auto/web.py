@@ -1391,8 +1391,11 @@ _FO_NS = 'xmlns="http://www.w3.org/1999/xhtml"'
 # Right-column panel geometry — same coordinate system as the SVG nodes.
 _PANEL_X = 640
 _PANEL_W = 210
-_LOADS_PANEL = (_PANEL_X, 150, _PANEL_W, 120)   # aligns with Home (y=180..240)
-_MODES_PANEL = (_PANEL_X, 250, _PANEL_W, 200)   # aligns with Car  (y=340..400), tall enough for 5 buttons
+# Right-column stack: Top loads top-aligned with the Solar node (y=20);
+# Automation fills the rest of the column down to the viewbox bottom so
+# all five buttons fit without clipping.
+_LOADS_PANEL = (_PANEL_X, 20, _PANEL_W, 130)
+_MODES_PANEL = (_PANEL_X, 160, _PANEL_W, 290)
 
 
 def _loads_foreign(consumers: list[tuple[str, float]] | None) -> str:
@@ -1413,14 +1416,23 @@ def _loads_foreign(consumers: list[tuple[str, float]] | None) -> str:
     )
 
 
+def _action_sub(active: bool, kill: bool, current: str, name: str) -> str:
+    """Subtitle text for an action button. Single source of truth for
+    the four states: firing / enabled-idle / kill-overridden / disabled."""
+    if active:
+        return "firing" if current == name else "enabled / idle"
+    return "kill switch on" if kill else "disabled"
+
+
 def _modes_foreign(pw: PowerReading | None, ev: ChargerState | None) -> str:
     """Dashboard control panel: per-action enable toggles + kill switch.
 
-    Five buttons stacked vertically:
-      1. Morning Dump   — toggles `settings.morning_dump_enabled`
-      2. Surplus        — toggles `settings.surplus_enabled`
-      3. Solar → EV     — toggles `settings.solar_passthrough_enabled`
-      4. Peak Export    — toggles `settings.peak_export_enabled`
+    Five EV-shaped buttons stacked vertically:
+
+      1. Morning Dump — toggles `settings.morning_dump_enabled`
+      2. Surplus      — toggles `settings.surplus_enabled`
+      3. Solar → EV   — toggles `settings.solar_passthrough_enabled`
+      4. Peak Export  — toggles `settings.peak_export_enabled`
       5. Disable All / Enable All — engages/releases the kill switch.
 
     Per-action buttons show as active only when their flag is True AND
@@ -1437,13 +1449,6 @@ def _modes_foreign(pw: PowerReading | None, ev: ChargerState | None) -> str:
             f'<button type="submit" name="action" value="{value}" class="{cls}">'
             f'{label}<small>{sub}</small></button>'
         )
-
-    def _action_sub(active: bool, kill: bool, current: str, name: str) -> str:
-        """Subtitle text for an action button. Single source of truth for
-        the four states: firing / enabled-idle / kill-overridden / disabled."""
-        if active:
-            return "firing" if current == name else "enabled / idle"
-        return "kill switch on" if kill else "disabled"
 
     # Morning Dump
     md_enabled = bool(getattr(ctl.settings, "morning_dump_enabled", True))
@@ -1491,7 +1496,7 @@ def _modes_foreign(pw: PowerReading | None, ev: ChargerState | None) -> str:
     x, y, w, h = _MODES_PANEL
     return (
         f'<foreignObject x="{x}" y="{y}" width="{w}" height="{h}">'
-        f'<div {_FO_NS} class="panel"><h3>Automation</h3>'
+        f'<div {_FO_NS} class="panel"><h3>Energy Automation</h3>'
         f'<form method="post" action="/mode">' + "".join(rows) +
         '</form></div></foreignObject>'
     )
@@ -1653,8 +1658,7 @@ def _node_value_label(name: str, pw: PowerReading | None, ev: ChargerState | Non
     if name == "home":
         return _fmt_kw(pw.load_w)
     if name == "battery":
-        verb = "charging" if pw.battery_w < 0 else "discharging" if pw.battery_w > 0 else "idle"
-        label = f"{_fmt_kw(abs(pw.battery_w))} {verb}"
+        label = _fmt_kw(abs(pw.battery_w))
         if not math.isnan(pw.battery_soc_pct):
             label += f" &middot; {pw.battery_soc_pct:.0f}%"
         return label
