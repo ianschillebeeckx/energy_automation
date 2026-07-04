@@ -71,7 +71,7 @@ class Settings(BaseSettings):
     # firmware auto-throttles discharge to land here exactly at the end
     # of its custom-tariff ON_PEAK window, so this doubles as the
     # discharge target *and* the cutoff.
-    peak_export_floor_pct: int = Field(default=40, ge=10, le=90)
+    peak_export_floor_pct: int = Field(default=30, ge=10, le=90)
     # Peak window (local time, 24h). Must align with the user's custom
     # Tesla tariff ON_PEAK block; the firmware obeys its own tariff for
     # the actual buy/sell math, we just flip mode at start_hour and
