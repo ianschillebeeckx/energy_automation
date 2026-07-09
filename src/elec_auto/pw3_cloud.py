@@ -23,11 +23,14 @@ because a silently-failed engage means the PW3 is in an unknown state.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 
 from loguru import logger
+
+VALID_MODES = frozenset({"self_consumption", "autonomous", "backup"})
 
 
 @dataclass(slots=True)
@@ -68,12 +71,37 @@ class PW3CloudClient:
     # --- reads --------------------------------------------------------
 
     def read_state(self) -> PW3State:
-        """Cache-bypass read of mode + reserve."""
+        """Cache-bypass read of mode + reserve.
+
+        Validates + retries once on garbage. `pypowerwall`'s first
+        force-read after connect has been observed to return
+        `mode=None reserve=0` — an unauthenticated / partially-populated
+        response. Trusting that garbage as a baseline poisons the
+        subsequent restore (writing mode=None is a silent no-op that
+        leaves the PW3 stuck in autonomous overnight; writing reserve=0
+        drains the pack to firmware's absolute floor).
+        """
         with self._lock:
             f = self._ensure_client().fleet
-            return PW3State(
-                mode=f.get_operating_mode(force=True),
-                reserve_pct=int(f.get_battery_reserve(force=True)),
+            for attempt in range(2):
+                mode = f.get_operating_mode(force=True)
+                reserve_raw = f.get_battery_reserve(force=True)
+                if (
+                    mode in VALID_MODES
+                    and reserve_raw is not None
+                    and 0 <= int(reserve_raw) <= 100
+                ):
+                    return PW3State(mode=mode, reserve_pct=int(reserve_raw))
+                logger.warning(
+                    "pw3_cloud: read_state got mode={!r} reserve={!r} "
+                    "(attempt {}/2)",
+                    mode, reserve_raw, attempt + 1,
+                )
+                if attempt == 0:
+                    time.sleep(1.0)
+            raise RuntimeError(
+                f"pw3_cloud: read_state returned invalid mode={mode!r} "
+                f"reserve={reserve_raw!r} after retry",
             )
 
     # --- writes -------------------------------------------------------

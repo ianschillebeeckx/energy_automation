@@ -32,7 +32,7 @@ from .nws import NWS
 from .state import em_panel_sum
 from .policy import Decision
 from .powerwall import Powerwall, PowerReading, PowerwallUnavailable
-from .pw3_cloud import PW3CloudClient, PW3State
+from .pw3_cloud import VALID_MODES as _PW3_VALID_MODES, PW3CloudClient, PW3State
 from .samples import (
     Forecast, ForecastStore, LoadStore, ObservationStore, Sample, SampleStore,
     WeatherStore,
@@ -388,6 +388,20 @@ def _pw3_client() -> PW3CloudClient:
 _PEAK_BASELINE_PATH = Path("state") / "peak_export_baseline.json"
 
 
+def _is_valid_pw3_state(s: PW3State | None) -> bool:
+    """Sanity-check a PW3State before we trust it as a restore target.
+
+    An invalid baseline (mode=None, reserve outside [1,100]) written to
+    disk once and restored blindly the next hour has bitten us live:
+    `set_operating_mode(None)` is a silent no-op that left the PW3 stuck
+    in autonomous overnight; `set_battery_reserve(0)` drained the pack
+    to firmware's absolute floor and forced grid import until morning.
+    """
+    if s is None:
+        return False
+    return s.mode in _PW3_VALID_MODES and 0 <= s.reserve_pct <= 100
+
+
 def _save_peak_baseline(s: PW3State) -> None:
     """Persist (mode, reserve) so we know what to restore to after peak.
 
@@ -395,6 +409,13 @@ def _save_peak_baseline(s: PW3State) -> None:
     the peak window. Survives restarts so a crash mid-discharge doesn't
     leave the PW3 stuck in TBC forever.
     """
+    if not _is_valid_pw3_state(s):
+        logger.error(
+            "peak_export: refusing to save invalid baseline "
+            "mode={!r} reserve={}",
+            s.mode, s.reserve_pct,
+        )
+        return
     try:
         _PEAK_BASELINE_PATH.parent.mkdir(parents=True, exist_ok=True)
         _PEAK_BASELINE_PATH.write_text(json.dumps(
@@ -498,6 +519,17 @@ def _restore_pw3_baseline_if_set() -> None:
     """
     baseline = _read_peak_baseline()
     if baseline is None:
+        return
+    if not _is_valid_pw3_state(baseline):
+        # Poisoned baseline on disk (from an older build or a bad read).
+        # Drop it — leaving the PW3 in whatever state it's in is far safer
+        # than writing mode=None / reserve=0 into it.
+        logger.error(
+            "peak_export: refusing to restore invalid baseline "
+            "mode={!r} reserve={} — clearing file",
+            baseline.mode, baseline.reserve_pct,
+        )
+        _clear_peak_baseline()
         return
     try:
         client = _pw3_client()
