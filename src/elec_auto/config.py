@@ -53,12 +53,6 @@ class Settings(BaseSettings):
     # no action runs even if its flag is True.
     surplus_enabled: bool = True
     morning_dump_enabled: bool = True
-    # SolarPassthrough is off by default — it's a manual override the
-    # user opts into when they want EV-over-battery priority (e.g. low
-    # SoC morning, but the day's plan needs the car charged). When on,
-    # it partitions cleanly with Surplus by SoC: SolarPassthrough fires
-    # below the reserve, Surplus above it.
-    solar_passthrough_enabled: bool = False
     # PeakExport drives the *Powerwall* (not the EV) — flips to TBC and
     # lowers the reserve so the firmware dispatches battery → grid during
     # the evening peak window. The buy/sell math that actually triggers
@@ -71,7 +65,7 @@ class Settings(BaseSettings):
     # firmware auto-throttles discharge to land here exactly at the end
     # of its custom-tariff ON_PEAK window, so this doubles as the
     # discharge target *and* the cutoff.
-    peak_export_floor_pct: int = Field(default=55, ge=10, le=90)
+    peak_export_floor_pct: int = Field(default=40, ge=10, le=90)
     # Peak window (local time, 24h). Must align with the user's custom
     # Tesla tariff ON_PEAK block; the firmware obeys its own tariff for
     # the actual buy/sell math, we just flip mode at start_hour and

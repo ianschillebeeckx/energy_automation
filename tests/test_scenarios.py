@@ -175,7 +175,9 @@ def test_scenario_1_day_in_the_life() -> None:
     assert d4.reason == "no action applies"
 
     # Tick 5: next-day 10:00 — sunny, but SoC well below 80% reserve.
-    # Surplus.applies fails on the reserve check.
+    # Merged Surplus applies (there's PV, we're out of the dump window)
+    # but its decide() holds the EV off in the "battery-first" regime
+    # until SoC crosses the threshold.
     t5 = day2.replace(hour=10, minute=0)
     d5 = ctl.tick(
         t5,
@@ -186,7 +188,8 @@ def test_scenario_1_day_in_the_life() -> None:
     )
     assert d5.on is False
     assert d5.target_amps == 0
-    assert d5.reason == "no action applies"
+    assert d5.action_name == "surplus"
+    assert "battery-first" in d5.reason
 
     # Tick 6: next-day 14:00 — SoC has recovered to 85%, sun still up,
     # surplus fires again. solar=4 kW, load=1 kW -> 3000 W / 240 V = 12 A.

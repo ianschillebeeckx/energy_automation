@@ -267,12 +267,17 @@ def test_surplus_charges_on_2026_05_17() -> None:
             pv_forecasts=SURPLUS_2026_05_17_FORECASTS,
         )
         st = ctl.state
+        # Merged Surplus applies whenever solar > 0 and we're out of the
+        # dump window. Whether it *charges* is determined inside
+        # decide(): SoC below threshold → battery-first hold; SoC at/
+        # above threshold with enough net surplus → EV on.
         surplus_applies = (
-            st.soc_pct is not None
-            and st.soc_pct >= 80
-            and st.solar_w is not None
+            st.solar_w is not None
             and st.solar_w > 0
             and st.load_w is not None
+        )
+        soc_above_threshold = (
+            st.soc_pct is not None and st.soc_pct >= 80
         )
         # Net surplus must clear the min-amps bar to actually charge.
         min_w = s.ev_min_amps * s.ev_voltage
@@ -280,7 +285,7 @@ def test_surplus_charges_on_2026_05_17() -> None:
             (st.solar_w or 0) - (st.load_w or 0)
             if surplus_applies else 0.0
         )
-        if surplus_applies and net_surplus_w >= min_w:
+        if surplus_applies and soc_above_threshold and net_surplus_w >= min_w:
             assert (
                 d.action_name == "surplus"
                 and d.on is True
@@ -293,7 +298,9 @@ def test_surplus_charges_on_2026_05_17() -> None:
             )
             fired += 1
         elif surplus_applies:
-            # Action applies, but below-min surplus -> hold (on=False, name=surplus).
+            # Action applies but decide holds — either battery-first
+            # (below threshold) or below-min surplus. Both look like
+            # Decision(0, off, name=surplus).
             assert d.on is False and d.target_amps == 0, (
                 f"surplus should hold at {now.strftime('%H:%M:%S')}: "
                 f"soc={st.soc_pct} solar={st.solar_w} load={st.load_w} "

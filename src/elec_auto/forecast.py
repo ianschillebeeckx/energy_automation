@@ -196,6 +196,56 @@ def load_kwh_in_range(
     return total_kwh
 
 
+def load_kwh_in_window(
+    samples: SampleStore, start_ts: int, end_ts: int,
+) -> float:
+    """Total load (kWh) across [start_ts, end_ts] using yesterday-shifted samples.
+
+    "Tomorrow = yesterday" model. Used when the window we care about is
+    entirely in the future and we're guessing what it'll look like.
+    """
+    lf = load_forecast(samples, start_ts, end_ts)
+    return _integrate_ts_w([(f.ts, f.load_w) for f in lf], start_ts, end_ts)
+
+
+def actual_load_kwh_in_window(
+    samples: SampleStore, start_ts: int, end_ts: int,
+) -> float:
+    """Total load (kWh) across an already-elapsed window from real samples.
+
+    No time shift — reads what we recorded and integrates. Used by the
+    nightly peak_export auto-floor job which runs after the overnight
+    window has completed and looks backward.
+    """
+    src = samples.read_range(start_ts, end_ts)
+    pts = [(s.ts, s.load_w) for s in src if s.load_w is not None and s.load_w >= 0]
+    return _integrate_ts_w(pts, start_ts, end_ts)
+
+
+def actual_non_ev_load_kwh_in_window(
+    samples: SampleStore,
+    loads: LoadStore,
+    start_ts: int,
+    end_ts: int,
+    ev_circuit_name: str = "EV Charger",
+) -> float:
+    """`actual_load_kwh_in_window` minus the EV circuit's recorded draw.
+
+    Used by the peak_export auto-floor computation so that a night
+    where the EV charged doesn't inflate the "typical overnight
+    house draw" estimate. Clamps at 0 for the (rare) case where
+    Emporia's EV integration is slightly higher than PW3's total
+    (sensor noise).
+    """
+    house_kwh = actual_load_kwh_in_window(samples, start_ts, end_ts)
+    ev_pts = [
+        (r.ts, r.watts)
+        for r in loads.read_range(start_ts, end_ts, circuit=ev_circuit_name)
+    ]
+    ev_kwh = _integrate_ts_w(ev_pts, start_ts, end_ts)
+    return max(0.0, house_kwh - ev_kwh)
+
+
 def soc_forecast(
     *,
     now_ts: int,
