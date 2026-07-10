@@ -74,6 +74,17 @@ class Settings(BaseSettings):
     # (soc − reserve) / time_remaining_in_ON_PEAK.
     peak_export_start_hour: int = Field(default=19, ge=0, le=23)
     peak_export_end_hour: int = Field(default=20, ge=0, le=23)
+    # PW3 "resting" state to return to after PeakExport ends. Historically
+    # we captured whatever the pack was in at engage time and restored to
+    # that — but the pack can end up in an unexpected mode ("autonomous"
+    # left over from an earlier bug, or a manual Tesla-app flip while
+    # peak_export is disabled) and we'd faithfully restore the wrong
+    # thing. These two knobs make the restore target explicit.
+    pw3_default_mode: str = Field(
+        default="self_consumption",
+        pattern="^(self_consumption|autonomous|backup)$",
+    )
+    pw3_default_reserve_pct: int = Field(default=0, ge=0, le=100)
 
     # Powerwall usable capacity (kWh). One PW3 unit is 13.5 kWh; override
     # in .env if the site has more. Used by the morning-dump calculator.

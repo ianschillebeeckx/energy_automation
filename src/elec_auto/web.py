@@ -499,8 +499,12 @@ def _apply_pw3_decision(decision: Decision) -> None:
     """Push a PW3-targeted Decision (mode + reserve) to the Fleet API.
 
     Idempotency: read current state first, skip the write if it already
-    matches. Baseline: on first engage (no baseline saved yet), capture
-    the current state before flipping so we know what to restore to.
+    matches. Baseline: on first engage (no baseline saved yet), snapshot
+    the user's *configured* resting state — not whatever the pack
+    happens to be in right now. Trusting the live state at engage time
+    means a manual Tesla-app flip (or an older bug that left the pack
+    in autonomous) becomes the "return to" target after the peak window
+    ends, which is exactly the incident that motivated this change.
     """
     if decision.pw3_mode is None or decision.pw3_reserve_pct is None:
         logger.warning(
@@ -511,9 +515,13 @@ def _apply_pw3_decision(decision: Decision) -> None:
     try:
         client = _pw3_client()
         current = client.read_state()
-        # Save baseline before our first engage.
+        # Save baseline (from user config, not live pack state) before
+        # our first engage.
         if _read_peak_baseline() is None:
-            _save_peak_baseline(current)
+            _save_peak_baseline(PW3State(
+                mode=settings.pw3_default_mode,
+                reserve_pct=settings.pw3_default_reserve_pct,
+            ))
         # Idempotency — skip the cloud round-trip if firmware already
         # matches what we'd write. The tariff/mode-transition logic on
         # the firmware sometimes re-applies state after a few minutes;
