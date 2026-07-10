@@ -13,10 +13,11 @@ import math
 import time
 from pathlib import Path
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Annotated
 
-from fastapi import FastAPI, Form
+from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from loguru import logger
 
@@ -25,6 +26,7 @@ from .control import Controller
 from .emporia import ChargerState, Emporia
 from .flow import Flows, decompose
 from .timewindow import next_dump_window
+from .forecast import actual_non_ev_load_kwh_in_window as _actual_non_ev_load_kwh
 from .forecast import load_forecast as _load_forecast
 from .forecast import non_ev_load_kwh_in_window as _non_ev_load_kwh
 from .forecast import soc_forecast as _soc_forecast
@@ -33,6 +35,7 @@ from .state import em_panel_sum
 from .policy import Decision
 from .powerwall import Powerwall, PowerReading, PowerwallUnavailable
 from .pw3_cloud import VALID_MODES as _PW3_VALID_MODES, PW3CloudClient, PW3State
+from . import runtime_config as _runtime_config
 from .samples import (
     Forecast, ForecastStore, LoadStore, ObservationStore, Sample, SampleStore,
     WeatherStore,
@@ -56,6 +59,8 @@ async def _lifespan(app_: FastAPI):
     if settings.latitude is not None and settings.longitude is not None:
         tasks.append(loop.create_task(_weather_loop()))
         logger.info("nws weather loop started")
+        tasks.append(loop.create_task(_peak_export_auto_loop()))
+        logger.info("peak_export auto-floor loop started")
     try:
         yield
     finally:
@@ -150,8 +155,6 @@ def _mode_label(ctl: Controller) -> str:
         return "Starting…"
     if d.action_name == "surplus":
         return "Surplus solar"
-    if d.action_name == "solar_passthrough":
-        return "Solar → EV"
     if d.action_name == "morning_dump":
         return "Morning dump"
     if d.action_name == "peak_export":
@@ -358,6 +361,27 @@ def _todays_sunset() -> datetime | None:
     sunset = sun(obs, date=today, tzinfo=tz)["sunset"]
     _sunset_cache = (today, sunset)
     return sunset
+
+
+def _next_sunrise_after(after: datetime) -> datetime | None:
+    """Astronomical sunrise strictly after `after` at the configured coords.
+
+    Returns None if lat/lon aren't set. Not cached — used by the Peak
+    Export auto-suggested floor which is only computed on dashboard
+    render, so the cost is trivial.
+    """
+    if settings.latitude is None or settings.longitude is None:
+        return None
+    from astral import Observer
+    from astral.sun import sun
+    tz = ZoneInfo(settings.timezone)
+    obs = Observer(latitude=settings.latitude, longitude=settings.longitude)
+    date = after.astimezone(tz).date()
+    for d in (date, date + timedelta(days=1)):
+        r = sun(obs, date=d, tzinfo=tz)["sunrise"]
+        if r > after:
+            return r
+    return None
 
 
 def _is_past_sunset() -> bool:
@@ -1418,6 +1442,70 @@ async def _control_loop() -> None:
         await asyncio.sleep(settings.poll_interval_sec)
 
 
+def _run_peak_export_auto_compute() -> None:
+    """Compute the overnight load, write an auto-sourced override that
+    expires at tonight's peak_export_end_hour."""
+    result = _peak_export_auto_compute()
+    if result is None:
+        logger.info("peak_export_auto: skipped — insufficient samples")
+        return
+    floor, note = result
+    tz = ZoneInfo(settings.timezone)
+    now = datetime.now(tz)
+    end = now.replace(
+        hour=settings.peak_export_end_hour, minute=0,
+        second=0, microsecond=0,
+    )
+    if end <= now:
+        end += timedelta(days=1)
+    _runtime_config.set_if_absent_or_auto(
+        "peak_export_floor_pct", floor, end.timestamp(), note=note,
+    )
+
+
+async def _peak_export_auto_loop() -> None:
+    """Nightly-anchored auto-suggested peak_export floor.
+
+    Wakes once a day at sunrise+1h. Computes tonight's floor from the
+    just-completed overnight window (last night's 20:00 → now) using
+    real samples, then writes it as an override that expires at
+    tonight's 20:00. User overrides (`source="user"`) are preserved —
+    the auto job silently skips when one is present.
+
+    Backfill on startup: if today's sunrise+1h has already passed when
+    we boot, run the compute immediately so we have coverage for
+    tonight (rather than waiting until tomorrow morning).
+    """
+    if settings.latitude is None or settings.longitude is None:
+        logger.info("peak_export_auto: skipped (no lat/lon)")
+        return
+    loop = asyncio.get_running_loop()
+    tz = ZoneInfo(settings.timezone)
+
+    now = datetime.now(tz)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_sr = _next_sunrise_after(day_start)
+    if today_sr is not None and now > today_sr + timedelta(hours=1):
+        logger.info("peak_export_auto: startup backfill")
+        await loop.run_in_executor(None, _run_peak_export_auto_compute)
+
+    while True:
+        now = datetime.now(tz)
+        sr = _next_sunrise_after(now)
+        if sr is None:
+            logger.warning("peak_export_auto: no upcoming sunrise; retry in 6h")
+            await asyncio.sleep(6 * 3600)
+            continue
+        target = sr + timedelta(hours=1)
+        sleep_sec = (target - now).total_seconds()
+        logger.info(
+            "peak_export_auto: next run at {} (in {:.0f} min)",
+            target.strftime("%a %H:%M"), sleep_sec / 60.0,
+        )
+        await asyncio.sleep(max(sleep_sec, 60))
+        await loop.run_in_executor(None, _run_peak_export_auto_compute)
+
+
 _FO_NS = 'xmlns="http://www.w3.org/1999/xhtml"'
 
 # Right-column panel geometry — same coordinate system as the SVG nodes.
@@ -1459,13 +1547,12 @@ def _action_sub(active: bool, kill: bool, current: str, name: str) -> str:
 def _modes_foreign(pw: PowerReading | None, ev: ChargerState | None) -> str:
     """Dashboard control panel: per-action enable toggles + kill switch.
 
-    Five EV-shaped buttons stacked vertically:
+    Four EV-shaped buttons stacked vertically:
 
       1. Morning Dump — toggles `settings.morning_dump_enabled`
       2. Surplus      — toggles `settings.surplus_enabled`
-      3. Solar → EV   — toggles `settings.solar_passthrough_enabled`
-      4. Peak Export  — toggles `settings.peak_export_enabled`
-      5. Disable All / Enable All — engages/releases the kill switch.
+      3. Peak Export  — toggles `settings.peak_export_enabled`
+      4. Disable All / Enable All — engages/releases the kill switch.
 
     Per-action buttons show as active only when their flag is True AND
     the kill switch is not engaged (the kill switch overrides). EVSE
@@ -1492,13 +1579,6 @@ def _modes_foreign(pw: PowerReading | None, ev: ChargerState | None) -> str:
     sp_active = sp_enabled and not ctl.kill_switch
     sp_sub = _action_sub(sp_active, ctl.kill_switch, current_action or "", "surplus")
 
-    # Solar → EV (SolarPassthrough)
-    spt_enabled = bool(getattr(ctl.settings, "solar_passthrough_enabled", False))
-    spt_active = spt_enabled and not ctl.kill_switch
-    spt_sub = _action_sub(
-        spt_active, ctl.kill_switch, current_action or "", "solar_passthrough",
-    )
-
     # Peak Export (PeakExport — drives the PW3, not the EV)
     pe_enabled = bool(getattr(ctl.settings, "peak_export_enabled", False))
     pe_active = pe_enabled and not ctl.kill_switch
@@ -1521,7 +1601,6 @@ def _modes_foreign(pw: PowerReading | None, ev: ChargerState | None) -> str:
     rows = [
         _btn("toggle_morning_dump", "Morning Dump", md_sub, md_active),
         _btn("toggle_surplus", "Surplus", sp_sub, sp_active),
-        _btn("toggle_solar_passthrough", "Solar → EV", spt_sub, spt_active),
         _btn("toggle_peak_export", "Peak Export", pe_sub, pe_active),
         _btn(ks_value, ks_label, ks_sub, ks_active),
     ]
@@ -1785,6 +1864,280 @@ def _flow_svg(
     )
 
 
+def _peak_export_auto_compute() -> tuple[int, str] | None:
+    """Compute the peak_export floor from the just-completed overnight window.
+
+    Called at sunrise+1h — at which point [last night's peak_export_end,
+    now] is a fully-elapsed window we have real samples for. No
+    yesterday-shift. The floor is set so PW3 drains during 19-20:00 to
+    a value that still leaves ~10% at sunrise+1h *next* morning
+    (assuming tomorrow's overnight consumption is like tonight's).
+
+      overnight_load_kwh = actual_load_kwh_in_window(last_night_end, now)
+      overnight_drop_pp  = overnight_load_kwh / usable_kwh * 100
+      floor_pct          = round(overnight_drop_pp + 10)
+
+    Returns None if any input is missing (no samples, malformed
+    config). Caller keeps whatever's currently in place.
+    """
+    tz = ZoneInfo(settings.timezone)
+    now = datetime.now(tz)
+
+    # Window we want to measure: the just-completed overnight, defined
+    # as [last night's peak_export_end_hour → this morning's sunrise+1h].
+    # Anchoring both ends to wall-clock (not `now`) keeps the number
+    # comparable across days and stops mid-day calls from including
+    # daytime PV-covered consumption in the estimate.
+    end_today = now.replace(
+        hour=settings.peak_export_end_hour, minute=0,
+        second=0, microsecond=0,
+    )
+    night_start = end_today if end_today <= now else end_today - timedelta(days=1)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_sunrise = _next_sunrise_after(day_start)
+    if today_sunrise is None:
+        return None
+    night_end = today_sunrise + timedelta(hours=1)
+    if night_end > now:
+        # We haven't finished this morning's window yet — can't measure it.
+        return None
+
+    try:
+        # Non-EV load only — a night the EV happened to charge would
+        # otherwise inflate the "typical overnight draw" estimate and
+        # push the recommended floor sky-high.
+        kwh = _actual_non_ev_load_kwh(
+            _sample_store(),
+            _load_store(),
+            int(night_start.timestamp()), int(night_end.timestamp()),
+        )
+    except Exception:
+        logger.exception("peak_export auto: load integration failed")
+        return None
+    if kwh <= 0:
+        return None
+    usable_kwh = settings.battery_capacity_kwh * (
+        1.0 - settings.battery_raw_floor_pct / 100.0
+    )
+    if usable_kwh <= 0:
+        return None
+    drop_pp = kwh / usable_kwh * 100.0
+    floor = int(round(drop_pp + 10))
+    floor = max(10, min(90, floor))  # match Field(ge=10, le=90) constraint
+    note = (
+        f"overnight {night_start.strftime('%m-%d %H:%M')}"
+        f"→{night_end.strftime('%H:%M')}: "
+        f"{kwh:.1f} kWh non-EV = {drop_pp:.0f} pp + 10 pp buffer"
+    )
+    return floor, note
+
+
+def _fmt_expiry(expires_at: float) -> str:
+    """Compact 'expires HH:MM' or 'expires tomorrow HH:MM' label."""
+    tz = ZoneInfo(settings.timezone)
+    now = datetime.now(tz)
+    dt = datetime.fromtimestamp(expires_at, tz)
+    if dt.date() == now.date():
+        return f"expires {dt.strftime('%H:%M')}"
+    if dt.date() == (now.date() + timedelta(days=1)):
+        return f"expires tomorrow {dt.strftime('%H:%M')}"
+    return f"expires {dt.strftime('%m-%d %H:%M')}"
+
+
+def _badge(source: str | None) -> str:
+    """Small pill next to the section header.
+
+    `source` is None (no override, running on `.env` default), "user"
+    (dashboard override), or "auto" (nightly job).
+    """
+    if source == "user":
+        return '<span class="badge badge-live">today</span>'
+    if source == "auto":
+        return '<span class="badge badge-auto">auto</span>'
+    return '<span class="badge badge-default">default</span>'
+
+
+def _tunables_section() -> str:
+    """Runtime-adjustable action tunables — replaces the old Powerwall table.
+
+    Two grouped sections: Surplus (one knob) and Dump (three knobs
+    submitted together). Each section has its own Apply button — inputs
+    keep their pending value until submitted, so partial edits stay put.
+
+    Overrides expire on natural boundaries (see `runtime_config`
+    docstring for details). No wall-clock reset — the user sees the
+    expiry time inline.
+    """
+    overrides_full = _runtime_config.read_with_expiry()
+    overrides = {k: v["value"] for k, v in overrides_full.items()}
+
+    def _src(name: str) -> str | None:
+        v = overrides_full.get(name)
+        return v.get("source") if v else None
+
+    s = settings
+
+    def _pct_input(name: str, default: int, section_id: str) -> str:
+        current = overrides.get(name, default)
+        return (
+            f'<input id="{section_id}-{name}" type="number" name="{name}" '
+            f'min="0" max="100" step="1" value="{current}">'
+        )
+
+    def _time_input(name_prefix: str, def_h: int, def_m: int, section_id: str) -> str:
+        cur_h = int(overrides.get(f"{name_prefix}_hour", def_h))
+        cur_m = int(overrides.get(f"{name_prefix}_minute", def_m))
+        return (
+            f'<input id="{section_id}-{name_prefix}" type="time" '
+            f'name="{name_prefix}" value="{cur_h:02d}:{cur_m:02d}">'
+        )
+
+    # --- Surplus section ---------------------------------------------
+    sp_name = "battery_reserve_pct"
+    sp_overridden = sp_name in overrides
+    sp_expiry_hint = (
+        f' &middot; {_fmt_expiry(overrides_full[sp_name]["expires_at"])}'
+        if sp_overridden else ""
+    )
+    sp_reset = (
+        f'<button type="submit" formaction="/tunable/reset" '
+        f'name="section" value="surplus" class="reset">Reset</button>'
+        if sp_overridden else ""
+    )
+    surplus = (
+        '<div class="tunable-section">'
+        f'<div class="th">Surplus threshold {_badge(_src(sp_name))}</div>'
+        '<div class="hint">Route PV to EV once battery reaches this SoC. '
+        f'Default {s.battery_reserve_pct}%{sp_expiry_hint}.</div>'
+        '<form method="post" action="/tunable/apply" class="tunable-row">'
+        '<input type="hidden" name="section" value="surplus">'
+        '<label>SoC %'
+        + _pct_input(sp_name, s.battery_reserve_pct, "sp")
+        + '</label>'
+        '<div class="btn-row">'
+        '<button type="submit">Apply</button>'
+        f'{sp_reset}'
+        '</div>'
+        '</form>'
+        '</div>'
+    )
+
+    # --- Dump section ------------------------------------------------
+    dump_names = (
+        "morning_dump_floor_pct",
+        "morning_dump_start_hour", "morning_dump_start_minute",
+        "morning_dump_end_hour", "morning_dump_end_minute",
+    )
+    dump_overridden = any(n in overrides for n in dump_names)
+    # All dump entries expire at the same moment (see set_dump_section),
+    # so any one gives us the group expiry.
+    dump_expiry_hint = ""
+    if dump_overridden:
+        first = next(n for n in dump_names if n in overrides)
+        dump_expiry_hint = (
+            f' &middot; {_fmt_expiry(overrides_full[first]["expires_at"])}'
+        )
+    dump_reset = (
+        f'<button type="submit" formaction="/tunable/reset" '
+        f'name="section" value="dump" class="reset">Reset</button>'
+        if dump_overridden else ""
+    )
+    # Any dump entry's source represents the group (they're written together).
+    dump_source = (
+        _src(next(n for n in dump_names if n in overrides))
+        if dump_overridden else None
+    )
+    dump = (
+        '<div class="tunable-section">'
+        f'<div class="th">Dump window {_badge(dump_source)}</div>'
+        '<div class="hint">Drain the battery to a floor during this '
+        'morning window. Default '
+        f'{s.morning_dump_floor_pct}% &middot; '
+        f'{s.morning_dump_start_hour:02d}:{s.morning_dump_start_minute:02d}'
+        f'–{s.morning_dump_end_hour:02d}:{s.morning_dump_end_minute:02d}'
+        f'{dump_expiry_hint}.</div>'
+        '<form method="post" action="/tunable/apply" class="tunable-row">'
+        '<input type="hidden" name="section" value="dump">'
+        '<label>Floor %'
+        + _pct_input("morning_dump_floor_pct", s.morning_dump_floor_pct, "dp")
+        + '</label>'
+        '<label>Start '
+        + _time_input(
+            "morning_dump_start",
+            s.morning_dump_start_hour, s.morning_dump_start_minute, "dp",
+        )
+        + '</label>'
+        '<label>End '
+        + _time_input(
+            "morning_dump_end",
+            s.morning_dump_end_hour, s.morning_dump_end_minute, "dp",
+        )
+        + '</label>'
+        '<div class="btn-row">'
+        '<button type="submit">Apply</button>'
+        f'{dump_reset}'
+        '</div>'
+        '</form>'
+        '</div>'
+    )
+
+    # --- Peak export section -----------------------------------------
+    pe_name = "peak_export_floor_pct"
+    pe_overridden = pe_name in overrides
+    pe_expiry_hint = (
+        f' &middot; {_fmt_expiry(overrides_full[pe_name]["expires_at"])}'
+        if pe_overridden else ""
+    )
+    pe_reset = (
+        f'<button type="submit" formaction="/tunable/reset" '
+        f'name="section" value="peak_export" class="reset">Reset</button>'
+        if pe_overridden else ""
+    )
+    # Prefill: whatever's currently effective. If auto has written a
+    # value, show it (with its explanation note). If not, show .env.
+    pe_source = _src(pe_name)
+    pe_note = (overrides_full[pe_name].get("note", "") if pe_overridden else "")
+    if pe_overridden:
+        pe_prefill = int(overrides[pe_name])
+        parts = []
+        if pe_source == "auto":
+            parts.append(f'Auto-computed from {pe_note}')
+        else:
+            parts.append(f'Fallback {s.peak_export_floor_pct}%')
+        pe_default_hint = " &middot; ".join(parts)
+    else:
+        pe_prefill = s.peak_export_floor_pct
+        pe_default_hint = (
+            f'Default {s.peak_export_floor_pct}% '
+            '(auto-updates each morning at sunrise+1h)'
+        )
+    peak_export = (
+        '<div class="tunable-section">'
+        f'<div class="th">Peak export floor {_badge(pe_source)}</div>'
+        f'<div class="hint">SoC PW3 discharges to during the 7–8 PM peak '
+        f'window. {pe_default_hint}{pe_expiry_hint}.</div>'
+        '<form method="post" action="/tunable/apply" class="tunable-row">'
+        '<input type="hidden" name="section" value="peak_export">'
+        '<label>SoC %'
+        f'<input id="pe-{pe_name}" type="number" name="{pe_name}" '
+        f'min="10" max="90" step="1" value="{pe_prefill}">'
+        '</label>'
+        '<div class="btn-row">'
+        '<button type="submit">Apply</button>'
+        f'{pe_reset}'
+        '</div>'
+        '</form>'
+        '</div>'
+    )
+
+    return (
+        '<h2>Tunables</h2>'
+        '<div class="tunables">'
+        f'{surplus}{dump}{peak_export}'
+        '</div>'
+    )
+
+
 def _render(flash: str = "", flash_ok: bool = True, demo: str = "") -> str:
     if demo:
         pw, ev, consumers = _demo_state(demo)
@@ -1804,31 +2157,14 @@ def _render(flash: str = "", flash_ok: bool = True, demo: str = "") -> str:
         0, "waiting on first tick", on=False, action_name="none",
     )
 
-    def fmt_w(v: float) -> str:
-        return f"{v:+.0f} W" if v else "0 W"
-
-    # `pw_err` / `ev_err` may be non-None even when the reading itself is
-    # present — that means "we have last-known data but it's stale." Show
-    # the data plus a staleness banner; only fall back to "unavailable"
-    # when we've literally never had a reading.
+    # `ev_err` may be non-None even when the reading itself is present —
+    # that means "we have last-known data but it's stale." Show the data
+    # plus a staleness banner; only fall back to "unavailable" when
+    # we've literally never had a reading.
     def _stale_banner(err: str | None) -> str:
         if not err:
             return ""
         return f"<tr><td colspan=2 class=err>{html.escape(err)}</td></tr>"
-
-    if pw:
-        pw_rows = (
-            _stale_banner(pw_err)
-            + f"<tr><td>solar</td><td>{fmt_w(pw.solar_w)}</td></tr>"
-            f"<tr><td>home load</td><td>{fmt_w(pw.load_w)}</td></tr>"
-            f"<tr><td>battery</td><td>{fmt_w(pw.battery_w)} "
-            f"<small>({'discharging' if pw.battery_w > 0 else 'charging' if pw.battery_w < 0 else 'idle'})</small></td></tr>"
-            f"<tr><td>grid</td><td>{fmt_w(pw.grid_w)} "
-            f"<small>({'importing' if pw.grid_w > 0 else 'exporting' if pw.grid_w < 0 else 'balanced'})</small></td></tr>"
-            f"<tr><td>SoC</td><td><b>{pw.battery_soc_pct:.1f} %</b></td></tr>"
-        )
-    else:
-        pw_rows = f"<tr><td colspan=2 class=err>Powerwall unavailable: {html.escape(pw_err or '')}</td></tr>"
 
     if ev:
         amps_value = ev.charge_rate_a
@@ -1906,6 +2242,24 @@ def _render(flash: str = "", flash_ok: bool = True, demo: str = "") -> str:
   .flash.ok {{ background: #2a71; color: var(--ok); }}
   .flash.err {{ background: #c331; color: var(--err); }}
   .err {{ color: var(--err); }}
+  .tunables {{ display: grid; grid-template-columns: 1fr; gap: .8em; }}
+  .tunable-section {{ padding: .6em .8em; border: 1px solid #8882; border-radius: 6px; }}
+  .tunable-section .th {{ font-weight: 600; margin: 0 0 .2em 0; display: flex; align-items: center; gap: .5em; }}
+  .tunable-section .hint {{ color: var(--muted); font-size: .85em; margin-bottom: .6em; }}
+  .tunable-row {{ display: flex; flex-wrap: wrap; gap: .8em; align-items: flex-end; margin: 0; }}
+  .tunable-row label {{ display: flex; flex-direction: column; font-size: .85em; color: var(--muted); gap: .2em; }}
+  .tunable-row input[type=number] {{ width: 5em; padding: .3em; font-size: 1em; }}
+  .tunable-row input[type=time] {{ width: 8em; padding: .3em; font-size: 1em; }}
+  .tunable-row .btn-row {{ display: flex; gap: .4em; margin-left: auto; }}
+  .tunable-row button {{ margin: 0; padding: .35em .9em; font-size: .9em; }}
+  .tunable-row .reset {{ background: transparent; border: 1px solid #8884; color: var(--muted); cursor: pointer; }}
+  .tunable-row .reset:hover {{ color: var(--err); border-color: var(--err); }}
+  .badge {{ display: inline-block; padding: 0 .5em; border-radius: 10px; font-size: .7em; font-weight: 500; text-transform: uppercase; letter-spacing: .05em; }}
+  .badge-default {{ background: #8883; color: var(--muted); }}
+  .badge-live {{ background: color-mix(in srgb, var(--ok) 22%, transparent); color: var(--ok); }}
+  .badge-auto {{ background: color-mix(in srgb, #48f 22%, transparent); color: #48f; }}
+  .tunable-section:has(.badge-live) {{ border-color: color-mix(in srgb, var(--ok) 40%, transparent); }}
+  .tunable-section:has(.badge-auto) {{ border-color: color-mix(in srgb, #48f 40%, transparent); }}
 </style></head><body>
 <p class="sub">{now} &middot; auto-refresh 15s</p>
 {flash_html}
@@ -1918,8 +2272,7 @@ def _render(flash: str = "", flash_ok: bool = True, demo: str = "") -> str:
 <h2>Usage</h2>
 {_circuits_section()}
 
-<h2>Powerwall</h2>
-<table>{pw_rows}</table>
+{_tunables_section()}
 
 <h2>EV Charger</h2>
 <table>{ev_rows}</table>
@@ -1938,8 +2291,8 @@ def _render(flash: str = "", flash_ok: bool = True, demo: str = "") -> str:
 
 
 @app.get("/", response_class=HTMLResponse)
-def index(demo: str = "") -> str:
-    return _render(demo=demo)
+def index(demo: str = "", flash: str = "", ok: str = "1") -> str:
+    return _render(flash=flash, flash_ok=(ok != "0"), demo=demo)
 
 
 @app.post("/mode")
@@ -1947,9 +2300,9 @@ def set_mode(action: Annotated[str, Form()]) -> RedirectResponse:
     """Per-action enable toggles + kill switch.
 
     `action` is one of:
-      - "toggle_morning_dump" / "toggle_surplus" /
-        "toggle_solar_passthrough" / "toggle_peak_export" — flip the
-        matching Settings flag in place (in-memory only; not persisted).
+      - "toggle_morning_dump" / "toggle_surplus" / "toggle_peak_export"
+        — flip the matching Settings flag in place (in-memory only;
+        not persisted).
       - "engage_kill_switch" / "release_kill_switch" — kill switch.
 
     The next `_control_tick` picks up the change naturally — no need
@@ -1964,10 +2317,6 @@ def set_mode(action: Annotated[str, Form()]) -> RedirectResponse:
         new_state = not bool(getattr(ctl.settings, "surplus_enabled", True))
         ctl.settings.surplus_enabled = new_state
         logger.info("surplus_enabled -> {} (user)", new_state)
-    elif action == "toggle_solar_passthrough":
-        new_state = not bool(getattr(ctl.settings, "solar_passthrough_enabled", False))
-        ctl.settings.solar_passthrough_enabled = new_state
-        logger.info("solar_passthrough_enabled -> {} (user)", new_state)
     elif action == "toggle_peak_export":
         new_state = not bool(getattr(ctl.settings, "peak_export_enabled", False))
         ctl.settings.peak_export_enabled = new_state
@@ -1981,6 +2330,233 @@ def set_mode(action: Annotated[str, Form()]) -> RedirectResponse:
     else:
         logger.warning("/mode: ignoring unknown action {!r}", action)
     return RedirectResponse("/", status_code=303)
+
+
+# --- runtime tunables -------------------------------------------------------
+#
+# The user nudges one of two sections at a time (Surplus / Dump), each
+# with its own Apply button. The handler:
+#
+#   1. Reads all fields for the section out of the form
+#   2. Validates each by round-tripping through Settings.model_validate
+#      (catches range errors from Field(ge=..., le=...))
+#   3. Persists them via `runtime_config.set_value` with a section-
+#      specific expiry:
+#
+#        Surplus → today's sunset (falls back to 24h if no coords)
+#        Dump    → today's dump-end (or tomorrow's if we're already past)
+#
+#   4. For the Dump-floor knob we also mirror the value into
+#      `morning_dump_sunny_floor_pct` so the internal sunny/normal
+#      distinction doesn't override the user's explicit choice.
+
+
+def _sunset_expiry() -> float:
+    """When a Surplus threshold override should lapse.
+
+    Today's sunset if we haven't passed it yet, otherwise tomorrow's
+    sunset. Falls back to +24h if geo isn't configured (astral needs
+    lat/lon; without them the "sunset" concept isn't defined so we
+    pick a safe long-ish TTL).
+    """
+    tz = ZoneInfo(settings.timezone)
+    now = datetime.now(tz)
+    sunset = _todays_sunset()
+    if sunset is None:
+        return (now + timedelta(hours=24)).timestamp()
+    if sunset > now:
+        return sunset.timestamp()
+    # Past today's sunset: compute tomorrow's.
+    from astral import Observer
+    from astral.sun import sun as _sun
+    obs = Observer(latitude=settings.latitude, longitude=settings.longitude)
+    tomorrow_sunset = _sun(
+        obs, date=(now + timedelta(days=1)).date(), tzinfo=tz,
+    )["sunset"]
+    return tomorrow_sunset.timestamp()
+
+
+def _peak_export_expiry() -> float:
+    """When a Peak Export floor override should lapse.
+
+    Next occurrence of `peak_export_end_hour:00` — after the discharge
+    window ends, the override has served its purpose. Setting at 18:30
+    → survives 19:00 engage, clears at 20:00. Setting at 22:00 →
+    survives until tomorrow 20:00 (covers tomorrow's window).
+    """
+    tz = ZoneInfo(settings.timezone)
+    now = datetime.now(tz)
+    end = now.replace(
+        hour=settings.peak_export_end_hour, minute=0,
+        second=0, microsecond=0,
+    )
+    if end > now:
+        return end.timestamp()
+    return (end + timedelta(days=1)).timestamp()
+
+
+def _dump_expiry(eff: object) -> float:
+    """When a Dump-section override should lapse.
+
+    The next occurrence of the (potentially just-overridden) dump-end
+    wall-clock. Setting Dump at 22:00 with end=08:00 → override
+    survives past midnight and clears at 08:00 the next morning, so
+    the change actually applies to the window it was meant for.
+    """
+    tz = ZoneInfo(settings.timezone)
+    now = datetime.now(tz)
+    end_today = now.replace(
+        hour=int(getattr(eff, "morning_dump_end_hour")),
+        minute=int(getattr(eff, "morning_dump_end_minute")),
+        second=0, microsecond=0,
+    )
+    if end_today > now:
+        return end_today.timestamp()
+    return (end_today + timedelta(days=1)).timestamp()
+
+
+def _validate_value(name: str, value: object) -> str | None:
+    """Try applying {name: value} through Settings validators; return
+    an error string on rejection, None on success (nothing written).
+
+    We round-trip via `model_validate` on a dict rather than
+    `model_copy` because model_copy bypasses Field validators — bad
+    values would slip in silently and only blow up in
+    `effective_settings` at read time.
+    """
+    try:
+        type(settings).model_validate({**settings.model_dump(), name: value})
+    except Exception as e:
+        return f"{name}: rejected ({e})"
+    return None
+
+
+def _parse_time(v: str) -> tuple[int, int] | None:
+    try:
+        h_str, m_str = v.split(":", 1)
+        return int(h_str), int(m_str)
+    except Exception:
+        return None
+
+
+@app.post("/tunable/apply")
+async def apply_tunables(request: Request) -> RedirectResponse:
+    """Apply one section's tunables in a single POST.
+
+    Form contains `section=surplus|dump` and section-specific fields.
+    We validate every field before writing anything so a partial
+    section apply can't happen — either all fields land or none do,
+    which keeps the override store consistent.
+    """
+    form = await request.form()
+    section = form.get("section", "")
+
+    if section == "surplus":
+        raw = form.get("battery_reserve_pct")
+        if raw is None:
+            return _tunable_flash("surplus: missing battery_reserve_pct")
+        try:
+            value = int(raw)
+        except ValueError:
+            return _tunable_flash(f"surplus: bad number {raw!r}")
+        err = _validate_value("battery_reserve_pct", value)
+        if err:
+            return _tunable_flash(err)
+        _runtime_config.set_value(
+            "battery_reserve_pct", value, _sunset_expiry(),
+        )
+        return RedirectResponse("/", status_code=303)
+
+    if section == "peak_export":
+        raw = form.get("peak_export_floor_pct")
+        if raw is None:
+            return _tunable_flash("peak_export: missing peak_export_floor_pct")
+        try:
+            value = int(raw)
+        except ValueError:
+            return _tunable_flash(f"peak_export: bad number {raw!r}")
+        err = _validate_value("peak_export_floor_pct", value)
+        if err:
+            return _tunable_flash(err)
+        _runtime_config.set_value(
+            "peak_export_floor_pct", value, _peak_export_expiry(),
+        )
+        return RedirectResponse("/", status_code=303)
+
+    if section == "dump":
+        # Parse everything up-front.
+        floor_raw = form.get("morning_dump_floor_pct")
+        start_raw = form.get("morning_dump_start")
+        end_raw = form.get("morning_dump_end")
+        if floor_raw is None or start_raw is None or end_raw is None:
+            return _tunable_flash("dump: missing fields")
+        try:
+            floor = int(floor_raw)
+        except ValueError:
+            return _tunable_flash(f"dump: bad floor {floor_raw!r}")
+        start_hm = _parse_time(str(start_raw))
+        end_hm = _parse_time(str(end_raw))
+        if start_hm is None or end_hm is None:
+            return _tunable_flash("dump: bad start/end time")
+        # Validate each field individually (Settings' per-field
+        # validators cover the ranges).
+        pairs: list[tuple[str, object]] = [
+            ("morning_dump_floor_pct", floor),
+            ("morning_dump_sunny_floor_pct", floor),  # mirror
+            ("morning_dump_start_hour", start_hm[0]),
+            ("morning_dump_start_minute", start_hm[1]),
+            ("morning_dump_end_hour", end_hm[0]),
+            ("morning_dump_end_minute", end_hm[1]),
+        ]
+        for name, value in pairs:
+            err = _validate_value(name, value)
+            if err:
+                return _tunable_flash(err)
+        # Compute expiry against the *new* end time — a change to the
+        # end knob should be reflected in when its override lapses.
+        try:
+            eff_after = type(settings).model_validate({
+                **settings.model_dump(),
+                "morning_dump_end_hour": end_hm[0],
+                "morning_dump_end_minute": end_hm[1],
+            })
+        except Exception:
+            eff_after = settings
+        expires = _dump_expiry(eff_after)
+        for name, value in pairs:
+            _runtime_config.set_value(name, value, expires)
+        return RedirectResponse("/", status_code=303)
+
+    logger.warning("/tunable/apply: unknown section {!r}", section)
+    return _tunable_flash(f"unknown section: {section!r}")
+
+
+@app.post("/tunable/reset")
+def reset_tunable(section: Annotated[str, Form()]) -> RedirectResponse:
+    """Clear all overrides in a section (revert to `.env` defaults)."""
+    if section == "surplus":
+        _runtime_config.clear("battery_reserve_pct")
+    elif section == "peak_export":
+        _runtime_config.clear("peak_export_floor_pct")
+    elif section == "dump":
+        for name in (
+            "morning_dump_floor_pct",
+            "morning_dump_sunny_floor_pct",
+            "morning_dump_start_hour", "morning_dump_start_minute",
+            "morning_dump_end_hour", "morning_dump_end_minute",
+        ):
+            _runtime_config.clear(name)
+    else:
+        logger.warning("/tunable/reset: unknown section {!r}", section)
+    return RedirectResponse("/", status_code=303)
+
+
+def _tunable_flash(msg: str) -> RedirectResponse:
+    """Redirect back to `/` with a flash-error query param."""
+    logger.warning("/tunable: {}", msg)
+    return RedirectResponse(
+        f"/?flash={html.escape(msg)}&ok=0", status_code=303,
+    )
 
 
 @app.post("/set")

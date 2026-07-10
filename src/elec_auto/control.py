@@ -40,6 +40,7 @@ from .config import Settings
 from .emporia import ChargerState
 from .policy import Decision
 from .powerwall import PowerReading
+from .runtime_config import effective as _effective_settings
 from .samples import Forecast, LoadStore, SampleStore
 from .state import State, step
 from .timewindow import next_dump_window
@@ -143,10 +144,14 @@ class Controller:
                 action_name="kill_switch",
             )
 
-        dump_start, dump_end = next_dump_window(now, self.settings)
+        # Apply today's UI-set overrides on top of the persisted Settings.
+        # Overrides live in state/config_overrides.json and expire at
+        # local midnight — see elec_auto.runtime_config.
+        eff = _effective_settings(self.settings)
+        dump_start, dump_end = next_dump_window(now, eff)
         ctx = ActionContext(
             now=now,
-            settings=self.settings,
+            settings=eff,
             dump_start=dump_start,
             dump_end=dump_end,
             pv_forecasts=pv_forecasts,
@@ -157,7 +162,7 @@ class Controller:
 
         candidates = [
             a for a in self.actions
-            if getattr(self.settings, a.enabled_setting, True)
+            if getattr(eff, a.enabled_setting, True)
             and a.applies(self.state, ctx)
         ]
         if not candidates:

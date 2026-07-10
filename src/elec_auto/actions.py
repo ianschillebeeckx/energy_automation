@@ -116,11 +116,25 @@ def _surplus_w(state: State, ctx: ActionContext) -> float:
 
 
 class Surplus:
-    """Charge from solar surplus once the battery is at reserve.
+    """Route surplus solar to the EV once the battery reaches its threshold.
 
-    Excluded from the dump window so it doesn't fight MorningDump.
-    Below-min rates result in a hold (target=0, on=False), not the
-    legacy "round up to 6 A" behavior that wasted battery overnight.
+    Two regimes, both gated on solar > 0 and out of the dump window:
+      - SoC < `battery_reserve_pct` (the "surplus threshold"): PW3 gets
+        priority. Command EV=0 so the battery drinks all of today's PV
+        first.
+      - SoC ≥ threshold: divert the surplus (solar − non-EV load) to the
+        EV. Battery stays roughly flat because the EV consumes what
+        would otherwise go into it.
+
+    This merges the old Surplus + SolarPassthrough pair (which
+    partitioned by predicate on the same threshold). The knob is now
+    the only thing that separates "battery-first" from "EV-first" —
+    threshold=100 means "never let EV cut in", threshold=1 means "always
+    let EV take the surplus."
+
+    Below-min rates in the ≥-threshold regime result in a hold
+    (target=0, on=False), not the legacy "round up to 6 A" behavior
+    that wasted battery overnight.
     """
 
     name = "surplus"
@@ -130,8 +144,6 @@ class Surplus:
     def applies(self, state: State, ctx: ActionContext) -> bool:
         if state.soc_pct is None or state.solar_w is None or state.load_w is None:
             return False
-        if state.soc_pct < ctx.settings.battery_reserve_pct:
-            return False
         if state.solar_w <= 0:
             return False
         if ctx.in_dump_window:
@@ -140,6 +152,13 @@ class Surplus:
 
     def decide(self, state: State, ctx: ActionContext) -> Decision:
         s = ctx.settings
+        soc = state.soc_pct or 0.0
+        if soc < s.battery_reserve_pct:
+            return Decision(
+                0,
+                f"battery-first: SoC {soc:.0f}% < threshold {s.battery_reserve_pct}%",
+                on=False,
+            )
         surplus_w = _surplus_w(state, ctx)
         target_amps = int(surplus_w // s.ev_voltage)
         if target_amps < s.ev_min_amps:
@@ -149,57 +168,6 @@ class Surplus:
         target_amps = min(target_amps, s.ev_max_amps)
         return Decision(
             target_amps, f"surplus {surplus_w:.0f}W -> {target_amps}A", on=True,
-        )
-
-
-class SolarPassthrough:
-    """Charge EV from solar without draining (or filling) the battery.
-
-    Same math as Surplus — set EV draw to (solar − non-EV load) so the
-    battery stays roughly flat. The difference is *when* it fires:
-    Surplus waits for the battery to reach `battery_reserve_pct` first;
-    SolarPassthrough fires below that threshold. Useful when the user
-    wants EV-over-battery priority (e.g. low SoC morning, but the
-    day's plan needs the car charged).
-
-    Partitioning:
-      - With Surplus: cleanly by SoC. Surplus covers ≥ reserve_pct,
-        SolarPassthrough covers < reserve_pct. They can't both apply.
-      - With MorningDump: by priority, not predicate. MorningDump
-        (priority 40) wins in the dump window when both apply. When
-        MorningDump is disabled, SolarPassthrough fires there too —
-        that's the intended override path.
-    """
-
-    name = "solar_passthrough"
-    priority = 25
-    enabled_setting = "solar_passthrough_enabled"
-
-    def applies(self, state: State, ctx: ActionContext) -> bool:
-        if state.soc_pct is None or state.solar_w is None or state.load_w is None:
-            return False
-        # Partition with Surplus: it owns the "battery full" half.
-        if state.soc_pct >= ctx.settings.battery_reserve_pct:
-            return False
-        if state.solar_w <= 0:
-            return False
-        return True
-
-    def decide(self, state: State, ctx: ActionContext) -> Decision:
-        s = ctx.settings
-        surplus_w = _surplus_w(state, ctx)
-        target_amps = int(surplus_w // s.ev_voltage)
-        if target_amps < s.ev_min_amps:
-            return Decision(
-                0,
-                f"solar passthrough {surplus_w:.0f}W < min {s.ev_min_amps}A",
-                on=False,
-            )
-        target_amps = min(target_amps, s.ev_max_amps)
-        return Decision(
-            target_amps,
-            f"solar passthrough {surplus_w:.0f}W -> {target_amps}A",
-            on=True,
         )
 
 
@@ -332,9 +300,9 @@ class PeakExport:
     the reserve regardless of when we flip mode.
 
     Partitioning: priority 50 (highest in the roster). If MorningDump
-    (40), Surplus (20), or SolarPassthrough (25) somehow apply at the
-    same time, PeakExport wins. In practice the peak window is evening
-    while the others are morning/daytime, so overlap is unlikely.
+    (40) or Surplus (20) somehow apply at the same time, PeakExport
+    wins. In practice the peak window is evening while the others are
+    morning/daytime, so overlap is unlikely.
     """
 
     name = "peak_export"
@@ -384,6 +352,5 @@ class PeakExport:
 DEFAULT_ACTIONS: list[Action] = [
     PeakExport(),
     MorningDump(),
-    SolarPassthrough(),
     Surplus(),
 ]
