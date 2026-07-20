@@ -40,12 +40,31 @@ class PW3State:
 
 
 class PW3CloudClient:
-    """Authenticates lazily, serializes writes, caches the live client."""
+    """Authenticates lazily, serializes writes, caches the live client.
+
+    Long-running processes have been observed to enter a state where
+    the cached `PyPowerwallFleetAPI` silently returns `mode=None
+    reserve=None` for every read (looks like an expired/stale OAuth
+    session that `connect()` originally accepted but eventually
+    stopped honoring). Symptoms: log floods with `read_state got
+    mode=None reserve=None` for hours; `apply: push to PW3 cloud
+    failed` on every peak_export tick; zero energy exported that
+    evening. Fresh subprocesses reading the same auth file work fine.
+
+    Mitigation: count consecutive invalid reads. On the RESET_STREAK-th,
+    drop the cached client so the next `_ensure_client` rebuilds it and
+    re-runs `connect()` — same pattern as `_LocalGateway._note_failure`.
+    """
+
+    _RESET_STREAK = 3
 
     def __init__(self, auth_path: str | Path = "state") -> None:
         self._auth_path = str(auth_path)
         self._client = None  # PyPowerwallFleetAPI, built lazily
         self._lock = Lock()
+        # Count of consecutive invalid `read_state` results. Cleared
+        # on any valid read.
+        self._invalid_streak = 0
 
     def _ensure_client(self):
         """Build + connect the FleetAPI client on first use.
@@ -68,6 +87,15 @@ class PW3CloudClient:
         self._client = c
         return c
 
+    def _recycle_client(self) -> None:
+        """Drop the cached client so the next call runs `connect()` fresh."""
+        logger.warning(
+            "pw3_cloud: recycling FleetAPI client after {} consecutive "
+            "invalid reads",
+            self._invalid_streak,
+        )
+        self._client = None
+
     # --- reads --------------------------------------------------------
 
     def read_state(self) -> PW3State:
@@ -80,6 +108,9 @@ class PW3CloudClient:
         subsequent restore (writing mode=None is a silent no-op that
         leaves the PW3 stuck in autonomous overnight; writing reserve=0
         drains the pack to firmware's absolute floor).
+
+        After RESET_STREAK consecutive invalid reads across calls, the
+        cached client is dropped so the next call reconnects cleanly.
         """
         with self._lock:
             f = self._ensure_client().fleet
@@ -91,6 +122,7 @@ class PW3CloudClient:
                     and reserve_raw is not None
                     and 0 <= int(reserve_raw) <= 100
                 ):
+                    self._invalid_streak = 0
                     return PW3State(mode=mode, reserve_pct=int(reserve_raw))
                 logger.warning(
                     "pw3_cloud: read_state got mode={!r} reserve={!r} "
@@ -99,6 +131,11 @@ class PW3CloudClient:
                 )
                 if attempt == 0:
                     time.sleep(1.0)
+            # Both attempts failed — bump streak, maybe recycle.
+            self._invalid_streak += 1
+            if self._invalid_streak >= self._RESET_STREAK:
+                self._recycle_client()
+                self._invalid_streak = 0
             raise RuntimeError(
                 f"pw3_cloud: read_state returned invalid mode={mode!r} "
                 f"reserve={reserve_raw!r} after retry",

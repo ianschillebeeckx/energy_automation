@@ -73,7 +73,9 @@ class Settings(BaseSettings):
     # redundant — Tesla rate-shapes discharge based on
     # (soc − reserve) / time_remaining_in_ON_PEAK.
     peak_export_start_hour: int = Field(default=19, ge=0, le=23)
+    peak_export_start_minute: int = Field(default=0, ge=0, le=59)
     peak_export_end_hour: int = Field(default=20, ge=0, le=23)
+    peak_export_end_minute: int = Field(default=0, ge=0, le=59)
     # PW3 "resting" state to return to after PeakExport ends. Historically
     # we captured whatever the pack was in at engage time and restored to
     # that — but the pack can end up in an unexpected mode ("autonomous"
