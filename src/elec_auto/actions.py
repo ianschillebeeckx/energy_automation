@@ -318,10 +318,14 @@ class PeakExport:
         if state.soc_pct <= s.peak_export_floor_pct:
             return False
         start_time = ctx.now.replace(
-            hour=s.peak_export_start_hour, minute=0, second=0, microsecond=0,
+            hour=s.peak_export_start_hour,
+            minute=s.peak_export_start_minute,
+            second=0, microsecond=0,
         )
         end_time = ctx.now.replace(
-            hour=s.peak_export_end_hour, minute=0, second=0, microsecond=0,
+            hour=s.peak_export_end_hour,
+            minute=s.peak_export_end_minute,
+            second=0, microsecond=0,
         )
         return start_time <= ctx.now < end_time
 

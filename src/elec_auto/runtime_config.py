@@ -58,6 +58,10 @@ TUNABLE_FIELDS: frozenset[str] = frozenset({
     "morning_dump_end_hour",
     "morning_dump_end_minute",
     "peak_export_floor_pct",
+    "peak_export_start_hour",
+    "peak_export_start_minute",
+    "peak_export_end_hour",
+    "peak_export_end_minute",
 })
 
 
