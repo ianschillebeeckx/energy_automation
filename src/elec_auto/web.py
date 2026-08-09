@@ -29,6 +29,7 @@ from .timewindow import next_dump_window
 from .forecast import actual_non_ev_load_kwh_in_window as _actual_non_ev_load_kwh
 from .forecast import load_forecast as _load_forecast
 from .forecast import non_ev_load_kwh_in_window as _non_ev_load_kwh
+from .forecast import pv_kwh_in_range as _pv_kwh_in_range
 from .forecast import soc_forecast as _soc_forecast
 from .nws import NWS
 from .state import em_panel_sum
@@ -187,33 +188,64 @@ def _emporia() -> Emporia:
 _pw_failure_streak = 0
 
 
+_pw_cloud_fallback_streak = 0
+
+
 def _safe_pw() -> tuple[PowerReading | None, str | None]:
-    global _pw_failure_streak
+    """Read a PowerReading from the local gateway, or fall back to the cloud.
+
+    Local-gateway priority (faster, cheaper, doesn't touch the Fleet
+    API rate limit). When the local read fails OR is in its back-off
+    window, try the Fleet API `get_live_status` — same data, ~1 s
+    lag, but requires a network round-trip to Tesla. Only when BOTH
+    fail do we surface None (which pins Surplus's freshness gate).
+    """
+    global _pw_failure_streak, _pw_cloud_fallback_streak
+    local_err: str | None = None
     try:
         reading = _powerwall().read()
+        if _pw_failure_streak > 0:
+            logger.info(
+                "powerwall (local) recovered after {} failed read(s)",
+                _pw_failure_streak,
+            )
+            _pw_failure_streak = 0
+        if _pw_cloud_fallback_streak > 0:
+            logger.info(
+                "powerwall (local) recovered; cloud fallback ran for {} tick(s)",
+                _pw_cloud_fallback_streak,
+            )
+            _pw_cloud_fallback_streak = 0
+        return reading, None
     except PowerwallUnavailable as e:
         # Inside the gateway's back-off window — not a fresh attempt,
-        # nothing new to say. Stay silent so the log stays readable.
-        return None, str(e)
+        # nothing new to say. Fall through to cloud.
+        local_err = str(e)
     except Exception as e:
         _pw_failure_streak += 1
         if _pw_failure_streak == 1:
-            # First failure: full traceback so we can see what broke.
-            logger.exception("powerwall read failed (entering back-off)")
+            logger.exception("powerwall (local) read failed; trying cloud")
         else:
-            # Subsequent real attempts (gated by the gateway back-off,
-            # so at most one per ~5 min). One-liner — the originating
-            # traceback is already in the log a few minutes up.
             logger.warning(
-                "powerwall still failing ({} consecutive): {}",
+                "powerwall (local) still failing ({} consecutive): {}",
                 _pw_failure_streak, e,
             )
-        return None, str(e)
-    if _pw_failure_streak > 0:
-        logger.info(
-            "powerwall recovered after {} failed read(s)", _pw_failure_streak,
+        local_err = str(e)
+
+    # Cloud fallback via Fleet API get_live_status.
+    try:
+        reading = _pw3_client().read_live()
+    except Exception as e:
+        # Both dead — no reading this tick. Surplus's freshness gate
+        # will refuse to fire once the age exceeds telemetry_fresh_sec.
+        logger.warning(
+            "powerwall cloud fallback also failed: {} (local: {})",
+            e, local_err,
         )
-        _pw_failure_streak = 0
+        return None, local_err
+    _pw_cloud_fallback_streak += 1
+    if _pw_cloud_fallback_streak == 1:
+        logger.info("powerwall: serving from cloud fallback (local: {})", local_err)
     return reading, None
 
 
@@ -276,6 +308,77 @@ def _warm_cache_from_db() -> None:
         )
         _last_ev_ts = float(latest.ts)
 
+    _warm_controller_from_sample(latest)
+
+
+def _warm_controller_from_sample(latest) -> None:
+    """Seed `_ctl().state` from the last DB sample.
+
+    The Controller starts with a blank State() — meaning solar_w /
+    soc_pct / etc. are None until the first successful network tick.
+    During a PW3 or Emporia outage that lands right at startup, that
+    means Surplus can't apply (needs solar_w & soc_pct) and the EV is
+    turned off even though we have a perfectly good pre-restart
+    reading in the DB.
+
+    Preserve the ORIGINAL sample ts as `pw_last_ts` / `em_last_ts` /
+    `ev_last_ts` (NOT `now`). The freshness gate in Surplus.applies
+    is the safety authority: if the DB row is > telemetry_fresh_sec
+    old the gate still rejects it, and the EV correctly stays off.
+    If the row is fresh, we bridge the restart without dropping
+    charging on the floor.
+    """
+    from .state import State, _compute_non_ev_load
+
+    ts = float(latest.ts)
+    has_pw = latest.pw_ok and any(
+        v is not None
+        for v in (latest.solar_w, latest.load_w, latest.battery_w, latest.grid_w)
+    )
+    has_em = bool(latest.em_ok and latest.load_w is not None)
+    has_ev = latest.charger_amps is not None or latest.charger_on is not None
+
+    load_source = "pw3" if has_pw else ("emporia" if has_em else None)
+    ev_status = latest.charger_status
+    ev_on = bool(latest.charger_on) if latest.charger_on is not None else None
+    ev_amps = latest.charger_amps
+
+    non_ev = _compute_non_ev_load(
+        load_source=load_source,
+        pw_load_w=latest.load_w if has_pw else None,
+        em_load_w=latest.load_w if (has_em and not has_pw) else None,
+        ev_circuit_w=None,  # not persisted
+        ev_amps=ev_amps, ev_on=ev_on, ev_status=ev_status,
+        settings=settings,
+    )
+
+    warmed = State(
+        ts=ts,
+        soc_pct=latest.soc_pct,
+        solar_w=latest.solar_w,
+        battery_w=latest.battery_w,
+        grid_w=latest.grid_w,
+        pw_load_w=latest.load_w if has_pw else None,
+        em_load_w=latest.load_w if has_em else None,
+        load_w=latest.load_w,
+        non_ev_load_w=non_ev,
+        ev_amps=ev_amps,
+        ev_on=ev_on,
+        ev_status=ev_status,
+        pw_last_ts=ts if has_pw else None,
+        em_last_ts=ts if has_em else None,
+        ev_last_ts=ts if has_ev else None,
+        load_source=load_source,
+        soc_source="pw3" if (has_pw and latest.soc_pct is not None) else None,
+    )
+    _ctl().state = warmed
+    logger.info(
+        "warm cache: seeded Controller state from sample at {} "
+        "(pw_ok={} em_ok={}, {}s ago)",
+        datetime.fromtimestamp(ts, ZoneInfo(settings.timezone)).strftime("%H:%M:%S"),
+        latest.pw_ok, latest.em_ok, int(time.time() - ts),
+    )
+
 
 def _staleness_msg(last_ts: float, source: str) -> str | None:
     """Build the dashboard's "stale Ns ago" hint, or None if fresh.
@@ -301,12 +404,38 @@ def _cached_ev() -> tuple[ChargerState | None, str | None]:
     return _last_ev_state, _staleness_msg(_last_ev_ts, "Emporia")
 
 
-# Channels we never want to show in "Top loads": the synthetic Main /
-# Balance / sub-panel roll-ups (double-counting) and the EV Charger
-# (which already has its own dashboard node).
-_TOP_CONSUMERS_EXCLUDE = {
-    "Main", "Balance", "Garage Subpanel", "EV Charger", "EV", "Car", "Tesla",
-}
+# Panel-monitor rollup labels historically written by this home. Each
+# Emporia-app rename left a tail of DB rows under the old label; kept
+# here so 24h-chart queries scrub them out. New writes are filtered
+# at the source via `Emporia.redundant_topline_labels()`.
+_LEGACY_PANEL_ROLLUPS = frozenset({
+    "Main", "Balance",
+    "Garage Subpanel", "Garage Subpanel A", "Garage Subpanel B",
+})
+
+# EV-related labels — filtered from Top loads (the EV has its own
+# dashboard node on the flow diagram) but NOT from the per-circuit
+# chart (users want to see the EV draw over time as a real circuit).
+_EV_LOAD_LABELS = frozenset({"EV Charger", "EV", "Car", "Tesla"})
+
+
+def _redundant_rollup_exclude() -> set[str]:
+    """Panel-monitor rollups (double-count children). Excludes single-
+    channel devices like the EV Charger — its topline IS the sole
+    measurement. Used by _record_loads and the per-circuit chart.
+    """
+    live: set[str] = set()
+    try:
+        live = _emporia().redundant_topline_labels()
+    except Exception:
+        pass
+    return set(_LEGACY_PANEL_ROLLUPS) | live
+
+
+def _top_loads_exclude() -> set[str]:
+    """Redundant rollups PLUS EV labels (EV has its own dashboard
+    node, so we don't want it in "Top loads" either)."""
+    return _redundant_rollup_exclude() | set(_EV_LOAD_LABELS)
 
 
 def _safe_top_consumers(n: int = 3) -> list[tuple[str, float]] | None:
@@ -323,11 +452,12 @@ def _safe_top_consumers(n: int = 3) -> list[tuple[str, float]] | None:
         if not recent:
             return None
         latest_ts = max(r.ts for r in recent)
+        exclude = _top_loads_exclude()
         rows = [
             (r.circuit, r.watts)
             for r in recent
             if r.ts == latest_ts
-            and r.circuit not in _TOP_CONSUMERS_EXCLUDE
+            and r.circuit not in exclude
             and r.watts > 0
         ]
         rows.sort(key=lambda x: x[1], reverse=True)
@@ -694,14 +824,14 @@ def _em_loads(ev_circuit_name: str) -> tuple[float | None, float | None]:
         circuits = _emporia().all_circuit_loads(min_threshold_w=0.0)
     except Exception:
         return None, None
-    return em_panel_sum(circuits), circuits.get(ev_circuit_name)
-
-
-# Channels we treat as roll-ups, not individual circuits. The per-circuit
-# chart skips these because they double-count (Main = sum of everything;
-# Garage Subpanel = sum of its branches) and they'd otherwise dominate
-# the y-axis.
-_AGGREGATE_CIRCUITS = {"Main", "Garage Subpanel", "Balance"}
+    try:
+        live_labels = _emporia().topline_labels()
+    except Exception:
+        live_labels = set()
+    return (
+        em_panel_sum(circuits, aggregate_labels=live_labels),
+        circuits.get(ev_circuit_name),
+    )
 
 # Color palette for circuit polylines. Assigned in sorted-name order so
 # the same circuit gets the same color across page reloads. Sourced from
@@ -785,15 +915,16 @@ def _circuits_section() -> str:
     end_ts = now_ts + 12 * 3600
 
     DAY_SEC = 24 * 3600
+    exclude = _redundant_rollup_exclude()
     rows = [
         r for r in _load_store().read_range(start_ts, now_ts)
-        if r.circuit not in _AGGREGATE_CIRCUITS
+        if r.circuit not in exclude
     ]
     # Dumb forecast: yesterday's data for the same wall-clock hours we'd be
     # showing in the future half, shifted +24 h so it lands there.
     forecast_rows = [
         r for r in _load_store().read_range(now_ts - DAY_SEC, end_ts - DAY_SEC)
-        if r.circuit not in _AGGREGATE_CIRCUITS
+        if r.circuit not in exclude
     ]
 
     W, H = 900, 240
@@ -1266,6 +1397,16 @@ def _record_loads(ts: int) -> None:
     except Exception:
         logger.warning("emporia circuit loads read failed", exc_info=False)
         return
+    if not loads:
+        return
+    # Drop panel-monitor rollups (channel_num "1,2,3" for devices with
+    # child CTs) — they duplicate the sum of individual circuits and
+    # pollute both the Top loads panel and the per-circuit chart with
+    # a giant flat line. Keeps single-channel devices (EV Charger) so
+    # the EV shows up as a real circuit in the graph. em_load_w is
+    # captured separately from these rollups via em_panel_sum.
+    exclude = em.redundant_topline_labels()
+    loads = {k: v for k, v in loads.items() if k not in exclude}
     if not loads:
         return
     try:
@@ -1940,6 +2081,42 @@ def _peak_export_auto_compute() -> tuple[int, str] | None:
     return floor, note
 
 
+def _dump_sunny_state() -> tuple[int, str] | None:
+    """If today's PV forecast triggers MorningDump's sunny variant,
+    return (sunny_floor_pct, human-readable reason). Else None.
+
+    Mirrors `MorningDump._floor_pct` so the dashboard shows the same
+    number the action actually uses at fire time — otherwise the
+    "default 10%" hint in the Dump card is misleading on sunny days
+    (the action silently drops to 5% but the UI still displays 10%).
+    """
+    if settings.morning_dump_sunny_floor_pct == settings.morning_dump_floor_pct:
+        return None
+    try:
+        forecasts = _forecast_store().operational_in_range(0, 10**11)
+    except Exception:
+        return None
+    if not forecasts:
+        return None
+    tz = ZoneInfo(settings.timezone)
+    now = datetime.now(tz)
+    dump_start, _dump_end = next_dump_window(now, settings)
+    day_start = dump_start.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end = day_start + timedelta(days=1)
+    forecast_kwh = _pv_kwh_in_range(
+        forecasts,
+        int(day_start.timestamp()),
+        int(day_end.timestamp()),
+    )
+    if forecast_kwh < settings.morning_dump_sunny_threshold_kwh:
+        return None
+    return (
+        settings.morning_dump_sunny_floor_pct,
+        f"sunny: {forecast_kwh:.0f} kWh PV forecast "
+        f"≥ {settings.morning_dump_sunny_threshold_kwh:.0f} kWh threshold",
+    )
+
+
 def _fmt_expiry(expires_at: float) -> str:
     """Compact 'expires HH:MM' or 'expires tomorrow HH:MM' label."""
     tz = ZoneInfo(settings.timezone)
@@ -2055,19 +2232,30 @@ def _tunables_section() -> str:
         _src(next(n for n in dump_names if n in overrides))
         if dump_overridden else None
     )
+    # Sunny-mode auto-adjust: MorningDump's runtime picks between the
+    # normal and sunny floor each tick based on today's PV forecast. If
+    # sunny is active AND the user hasn't overridden, surface that on
+    # the badge + prefill so the UI matches what the action will do.
+    sunny = None if dump_overridden else _dump_sunny_state()
+    if sunny is not None:
+        dump_source = "auto"
+        dump_floor_prefill = sunny[0]
+        dump_floor_hint = f'Auto {sunny[0]}% ({sunny[1]}) &middot; normal {s.morning_dump_floor_pct}%'
+    else:
+        dump_floor_prefill = s.morning_dump_floor_pct
+        dump_floor_hint = f'Default {s.morning_dump_floor_pct}%'
     dump = (
         '<div class="tunable-section">'
         f'<div class="th">Dump window {_badge(dump_source)}</div>'
         '<div class="hint">Drain the battery to a floor during this '
-        'morning window. Default '
-        f'{s.morning_dump_floor_pct}% &middot; '
+        f'morning window. {dump_floor_hint} &middot; '
         f'{s.morning_dump_start_hour:02d}:{s.morning_dump_start_minute:02d}'
         f'–{s.morning_dump_end_hour:02d}:{s.morning_dump_end_minute:02d}'
         f'{dump_expiry_hint}.</div>'
         '<form method="post" action="/tunable/apply" class="tunable-row">'
         '<input type="hidden" name="section" value="dump">'
         '<label>Floor %'
-        + _pct_input("morning_dump_floor_pct", s.morning_dump_floor_pct, "dp")
+        + _pct_input("morning_dump_floor_pct", dump_floor_prefill, "dp")
         + '</label>'
         '<label>Start '
         + _time_input(

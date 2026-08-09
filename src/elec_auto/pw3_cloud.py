@@ -98,6 +98,43 @@ class PW3CloudClient:
 
     # --- reads --------------------------------------------------------
 
+    def read_live(self):
+        """Fresh instantaneous power balance via Fleet API.
+
+        Returns a `PowerReading` (from elec_auto.powerwall) so callers
+        can substitute this for the local-gateway reading without
+        caring which source served it. The Fleet API `get_live_status`
+        endpoint returns solar / battery / grid / load / SoC with a
+        timestamp lag of ~1 s in practice — good enough to keep
+        Surplus firing when the LAN gateway is unreachable.
+
+        Sign conventions on `battery_power`: verified against a live
+        response (solar 2724 W, load 227 W, grid 0, battery -2497 W;
+        SoC rising → battery is charging). Matches PowerReading's
+        docstring: > 0 discharging, < 0 charging. No sign flip.
+
+        `percentage_charged` is already displayed-% (Tesla-app scale),
+        so no `_to_displayed_soc` conversion is needed here.
+        """
+        from .powerwall import PowerReading  # avoid import cycle
+        with self._lock:
+            f = self._ensure_client().fleet
+            live = f.get_live_status()
+        if not isinstance(live, dict):
+            raise RuntimeError(f"pw3_cloud: read_live got {type(live)}, expected dict")
+        # Validate the fields we depend on.
+        for key in ("solar_power", "battery_power", "grid_power",
+                    "load_power", "percentage_charged"):
+            if live.get(key) is None:
+                raise RuntimeError(f"pw3_cloud: read_live missing {key}")
+        return PowerReading(
+            solar_w=float(live["solar_power"]),
+            load_w=float(live["load_power"]),
+            battery_w=float(live["battery_power"]),
+            grid_w=float(live["grid_power"]),
+            battery_soc_pct=float(live["percentage_charged"]),
+        )
+
     def read_state(self) -> PW3State:
         """Cache-bypass read of mode + reserve.
 

@@ -50,6 +50,12 @@ class Emporia:
             password=settings.emporia_password,
         )
         self._evse_gid = settings.emporia_evse_gid
+        # Cache of labels that map to whole-device rollups (channel_num
+        # "1,2,3") — populated on first call to `aggregate_labels`.
+        # Invalidated on process restart; sufficient because device
+        # renames in the Emporia app happen at user-scale (not
+        # tick-scale).
+        self._aggregate_labels_cache: set[str] | None = None
 
     def _charger_devices(self) -> list[VueDevice]:
         return [d for d in self._vue.get_devices() if d.ev_charger is not None]
@@ -150,6 +156,60 @@ class Emporia:
                 if watts >= min_threshold_w:
                     out[label] = watts
         return out
+
+    def topline_labels(self) -> set[str]:
+        """All whole-device rollup labels (channel_num "1,2,3").
+
+        Includes the EV charger's own topline — used by
+        `state.em_panel_sum` to compute whole-house load, which needs
+        BOTH the panel monitor's rollup AND the EV charger's own
+        measurement (the EV is typically on its own dedicated breaker
+        that the panel monitor doesn't cover).
+
+        Cached in the instance; a network hiccup on first call returns
+        an empty set (fail-open — worse to spam the dashboard with
+        stale legacy filters than to briefly miss an aggregate row).
+        """
+        if self._aggregate_labels_cache is not None:
+            return self._aggregate_labels_cache
+        try:
+            labels: set[str] = set()
+            for d in self._vue.get_devices():
+                if d.ev_charger is not None:
+                    labels.add(d.device_name or "EV Charger")
+                elif (d.device_name or "").strip():
+                    labels.add(d.device_name)
+                else:
+                    labels.add("Main")
+            self._aggregate_labels_cache = labels
+            return labels
+        except Exception:
+            return set()
+
+    def redundant_topline_labels(self) -> set[str]:
+        """Toplines that double-count children — safe to hide from graphs.
+
+        Subset of `topline_labels()` limited to devices with children
+        (i.e. the panel monitor's rollup which is the sum of individual
+        CTs). Excludes single-channel devices like the EV charger,
+        whose "topline" IS the only measurement of that circuit and
+        therefore isn't redundant with anything.
+
+        Consumers: `_record_loads` and `_circuits_section` — both want
+        to plot the EV as a real circuit, not filter it out.
+        """
+        labels: set[str] = set()
+        try:
+            for d in self._vue.get_devices():
+                if d.ev_charger is not None:
+                    continue  # EV topline is the sole measurement
+                elif (d.device_name or "").strip():
+                    labels.add(d.device_name)
+                else:
+                    labels.add("Main")
+        except Exception:
+            pass
+        return labels
 
     def top_consumers(self, n: int = 3) -> list[tuple[str, float]]:
         """Return top-N named circuits by instantaneous power draw, in watts.

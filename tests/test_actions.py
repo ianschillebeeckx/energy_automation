@@ -55,17 +55,37 @@ def _state(
     ev_on: bool | None = False,
     ev_status: str | None = None,
     ev_circuit_w: float | None = None,
+    load_source: str = "pw3",
 ) -> State:
+    # Match production: non_ev_load_w is computed by step() from the
+    # same helper — route the fixture through it so tests exercise the
+    # same source-matching arithmetic Surplus actually sees.
+    from elec_auto.state import _compute_non_ev_load
+    non_ev = _compute_non_ev_load(
+        load_source=load_source,
+        pw_load_w=load if load_source == "pw3" else None,
+        em_load_w=load if load_source == "emporia" else None,
+        ev_circuit_w=ev_circuit_w,
+        ev_amps=ev_amps, ev_on=ev_on, ev_status=ev_status,
+        settings=_settings(),
+    )
     return State(
         ts=_T0.timestamp(),
         soc_pct=soc,
         solar_w=solar,
         battery_w=battery,
         load_w=load,
+        non_ev_load_w=non_ev,
         ev_amps=ev_amps,
         ev_on=ev_on,
         ev_status=ev_status,
         ev_circuit_w=ev_circuit_w,
+        load_source=load_source,
+        # Match production: a State that has PW3-sourced values also
+        # has pw_last_ts set. Surplus.applies gates on freshness of this
+        # timestamp — leaving it None makes the test-fixture state look
+        # like a permanent PW3 outage and blocks Surplus.
+        pw_last_ts=_T0.timestamp() if solar is not None else None,
     )
 
 
@@ -220,7 +240,7 @@ def test_surplus_decide_uses_measured_ev_circuit_w_over_proxy() -> None:
     # Without the fix: ev_w_now=9600 → non_ev=-9200 → surplus=12200 → 40 A.
     st = _state(
         soc=85, solar=3000, load=400,
-        ev_on=True, ev_amps=40, ev_circuit_w=14.0,
+        ev_on=True, ev_amps=40, ev_status="Standby", ev_circuit_w=14.0,
     )
     d = a.decide(st, _ctx())
     assert d.target_amps == 10

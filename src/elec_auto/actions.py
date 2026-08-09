@@ -78,38 +78,17 @@ class Action(Protocol):
 
 
 def _surplus_w(state: State, ctx: ActionContext) -> float:
-    """Solar minus (non-EV load), in watts. Negative when load > solar.
+    """Solar minus non-EV load, in watts. Negative when load > solar.
 
-    "Non-EV load" subtracts the EV's own draw so we don't think it's
-    home consumption. The EV self-draw source depends on EVSE status:
-
-      "Charging": use the configured rate × voltage. Tracks real draw
-        within a few %, and crucially it's *instantaneous* — the same
-        time-base as pw.load_w. The measured Emporia `ev_circuit_w` is
-        a 1-minute rolling cloud average (`Scale.MINUTE` in emporia.py),
-        so subtracting it from an instantaneous PW3 load produced a
-        phantom non-EV load each time a charging session started, which
-        made Surplus bounce ON→OFF on a ~1 min cycle.
-
-      anything else: trust the measured Emporia value. In Standby /
-        Disconnected the EVSE is configured at some rate but the
-        contactor is open and the car draws ~0, so the configured
-        proxy would phantom-add kW of "EV draw."
-
-      no Emporia reading and not Charging: legacy proxy fallback for
-        first-tick / test paths where Emporia hasn't reported yet.
+    `state.non_ev_load_w` is computed in `state.step()` with a
+    source-matched EV subtraction (same time base as load_w) — see
+    the docstring there. This function is now a thin arithmetic
+    wrapper so callers can compute surplus without dereferencing
+    both fields.
     """
-    s = ctx.settings
-    if state.ev_on and state.ev_status == "Charging":
-        ev_w_now: float = (state.ev_amps or 0) * s.ev_voltage
-    elif state.ev_circuit_w is not None:
-        ev_w_now = state.ev_circuit_w
-    elif state.ev_on:
-        ev_w_now = (state.ev_amps or 0) * s.ev_voltage
-    else:
-        ev_w_now = 0.0
-    non_ev_load_w = (state.load_w or 0) - ev_w_now
-    return (state.solar_w or 0) - non_ev_load_w
+    solar = state.solar_w or 0.0
+    non_ev = state.non_ev_load_w if state.non_ev_load_w is not None else (state.load_w or 0.0)
+    return solar - non_ev
 
 
 # --- concrete actions --------------------------------------------------------
@@ -147,6 +126,25 @@ class Surplus:
         if state.solar_w <= 0:
             return False
         if ctx.in_dump_window:
+            return False
+        # Don't fire while PW3 solar is stale. Incident 2026-08-09: PW3
+        # went unreachable while EV was charging. `state.solar_w` stuck
+        # at the last good value (~3.8kW); `state.load_w` swapped to
+        # the fresh Emporia surrogate (which INCLUDES the EV via its
+        # own topline channel). `_surplus_w` subtracted the configured
+        # ev-rate proxy from that Emporia total; when the proxy > total
+        # (because Emporia lags a rate change, or because the EV self-
+        # draw exceeded the whole-house measurement window), non-EV
+        # load went negative and phantom surplus == frozen battery-
+        # charging rate + solar bled back into the amps target. Result:
+        # EV commanded up to 29A off ~4kW of actual solar. When solar
+        # is stale we simply don't know what's happening — hold.
+        max_age = ctx.settings.telemetry_fresh_sec
+        pw_fresh = (
+            state.pw_last_ts is not None
+            and (state.ts - state.pw_last_ts) <= max_age
+        )
+        if not pw_fresh:
             return False
         return True
 

@@ -29,25 +29,33 @@ from .config import Settings
 from .emporia import ChargerState
 from .powerwall import PowerReading
 
-# Emporia circuit labels we treat as device toplines — the "Main"
-# channel of one Emporia Vue, which measures the total current flowing
-# through that device's CTs. Named individual circuits (Fridge, Oven,
-# Lights, ...) are children of one of these toplines, so summing
-# toplines gives whole-house load without double-counting children.
-#
-# Specific to this home: the panel-monitor device is named "Garage
-# Subpanel" (so its Main channel comes through under that label, not
-# the literal "Main") and the EVSE is its own Vue device whose Main
-# comes through as "EV Charger".
-TOPLINE_CIRCUITS = frozenset({"Garage Subpanel", "EV Charger"})
+# Legacy fallback set. Named topline labels this home has historically
+# used ("Garage Subpanel" was the panel-monitor's `device_name` before
+# being renamed to "Garage Subpanel A"; "EV Charger" is the EVSE's
+# name). Kept only so tests + old-DB queries stay meaningful when no
+# live `Emporia.aggregate_labels()` is available. Production always
+# passes the live set through `em_panel_sum(..., aggregate_labels=...)`.
+TOPLINE_CIRCUITS = frozenset({
+    "Garage Subpanel", "Garage Subpanel A", "EV Charger",
+})
 
 
-def em_panel_sum(circuits: dict[str, float] | None) -> float | None:
+def em_panel_sum(
+    circuits: dict[str, float] | None,
+    aggregate_labels: set[str] | frozenset[str] | None = None,
+) -> float | None:
     """Whole-house load estimate from an Emporia reading.
 
-    Sums the device-topline channels (see `TOPLINE_CIRCUITS`) — not
-    the individual named circuits, because each named circuit is a
-    child of one of those toplines and would double-count.
+    Sums the device-topline channels — not the individual named
+    circuits, because each named circuit is a child of one of those
+    toplines and would double-count.
+
+    `aggregate_labels` is the live set from
+    `Emporia.aggregate_labels()`; passing it in makes renames in the
+    Emporia app safe (the old TOPLINE_CIRCUITS constant broke silently
+    when the user renamed "Garage Subpanel" → "Garage Subpanel A").
+    When None, falls back to TOPLINE_CIRCUITS for tests that stub the
+    Emporia layer.
 
     Returns None when the reading is missing or contains no toplines
     this tick, matching `step()`'s `em_load_w=None` semantics so the
@@ -56,7 +64,8 @@ def em_panel_sum(circuits: dict[str, float] | None) -> float | None:
     """
     if not circuits:
         return None
-    toplines = [w for name, w in circuits.items() if name in TOPLINE_CIRCUITS]
+    labels = aggregate_labels if aggregate_labels else TOPLINE_CIRCUITS
+    toplines = [w for name, w in circuits.items() if name in labels]
     return sum(toplines) if toplines else None
 
 
@@ -84,6 +93,17 @@ class State:
     pw_load_w: float | None = None
     em_load_w: float | None = None
     load_w: float | None = None       # derived: best of {pw_load_w, em_load_w}
+    # Non-EV whole-house load — same as load_w minus the EV's contribution,
+    # BUT computed with a source-matched pair to avoid time-base mismatch.
+    # When load_source is "pw3" (instantaneous), subtract the configured
+    # EV rate proxy (also instantaneous). When "emporia" (1-min avg),
+    # subtract the measured `ev_circuit_w` (also 1-min avg — cancels the
+    # lag). Naive `load_w - configured_proxy` was racey during EV ramps:
+    # em_load hadn't caught up yet, so subtraction underflowed to
+    # negative and Surplus computed phantom PV. Now computed inside
+    # `step()` so consumers can't reintroduce the mismatch by
+    # re-deriving it locally.
+    non_ev_load_w: float | None = None
 
     # EVSE last-known state (configured rate, not measured current).
     ev_amps: int | None = None
@@ -245,16 +265,84 @@ def step(
         now=now, settings=settings,
     )
 
+    non_ev_load_w = _compute_non_ev_load(
+        load_source=load_source,
+        pw_load_w=pw_load_w,
+        em_load_w=em_load,
+        ev_circuit_w=ev_circ_w,
+        ev_amps=ev_amps, ev_on=ev_on, ev_status=ev_status,
+        settings=settings,
+    )
+
     return State(
         ts=now,
         soc_pct=soc_pct,
         solar_w=solar_w, battery_w=battery_w, grid_w=grid_w,
         pw_load_w=pw_load_w, em_load_w=em_load, load_w=load_w,
+        non_ev_load_w=non_ev_load_w,
         ev_amps=ev_amps, ev_on=ev_on, ev_status=ev_status,
         ev_circuit_w=ev_circ_w,
         pw_last_ts=pw_last_ts, em_last_ts=em_last_ts, ev_last_ts=ev_last_ts,
         soc_source=soc_source, load_source=load_source,
     )
+
+
+def _compute_non_ev_load(
+    *,
+    load_source: str | None,
+    pw_load_w: float | None,
+    em_load_w: float | None,
+    ev_circuit_w: float | None,
+    ev_amps: int | None,
+    ev_on: bool | None,
+    ev_status: str | None,
+    settings: Settings,
+) -> float | None:
+    """Whole-house load minus the EV, time-base-matched to `load_source`.
+
+    Two rails, one per source, so the subtracted EV value always has
+    the same lag as the load it's being subtracted from:
+
+      pw3      : pw_load (instantaneous) − configured proxy
+                 (ev_amps × voltage, only when EVSE reports "Charging"
+                 — Standby/Disconnected means contactor is open and the
+                 car is drawing ~0 regardless of the configured rate).
+      emporia  : em_load (1-min avg) − ev_circuit_w (1-min avg).
+                 Falls back to config proxy if the EV channel is dark.
+
+    Clamped at 0 (a negative here means our EV estimate exceeded the
+    load measurement — sensor noise or brief lag mismatch, not a real
+    negative house load).
+    """
+    if load_source == "pw3" and pw_load_w is not None:
+        # Trust the configured rate when the EVSE is on AND not
+        # explicitly Standby/Disconnected (either of those means the
+        # contactor is open — the car is drawing ~0 regardless of the
+        # configured amps). Unknown status (None) counts as "maybe
+        # charging" — safer to over-subtract slightly than to leave
+        # phantom EV in the non-EV total.
+        if ev_on and ev_status not in ("Standby", "Disconnected"):
+            ev_w = (ev_amps or 0) * settings.ev_voltage
+        else:
+            ev_w = 0.0
+        return max(0.0, pw_load_w - ev_w)
+    if load_source == "emporia" and em_load_w is not None:
+        if ev_circuit_w is not None:
+            return max(0.0, em_load_w - ev_circuit_w)
+        # No Emporia EV reading — degrade gracefully with the config
+        # proxy. Not perfect (mismatched time base) but bounded at 0.
+        # Trust the configured rate when the EVSE is on AND not
+        # explicitly Standby/Disconnected (either of those means the
+        # contactor is open — the car is drawing ~0 regardless of the
+        # configured amps). Unknown status (None) counts as "maybe
+        # charging" — safer to over-subtract slightly than to leave
+        # phantom EV in the non-EV total.
+        if ev_on and ev_status not in ("Standby", "Disconnected"):
+            ev_w = (ev_amps or 0) * settings.ev_voltage
+        else:
+            ev_w = 0.0
+        return max(0.0, em_load_w - ev_w)
+    return None
 
 
 def _pick_load(
