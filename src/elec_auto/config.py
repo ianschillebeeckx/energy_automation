@@ -118,11 +118,23 @@ class Settings(BaseSettings):
     morning_dump_start_minute: int = Field(default=0, ge=0, le=59)
     morning_dump_end_hour: int = Field(default=8, ge=0, le=23)
     morning_dump_end_minute: int = Field(default=0, ge=0, le=59)
-    # Ceiling on dump amperage. The PW3 inverter sustains ~11.5 kW AC of
-    # combined solar+battery → home; HVAC pulses can hit 4.5 kW. Capping
-    # the EV at 29 A (~7 kW) leaves room for the HVAC + a bit of base
-    # load without forcing grid import.
-    morning_dump_max_amps: int = Field(default=29, ge=6, le=40)
+    # Ceiling on dump amperage. Historically 29 A (~7 kW) to leave PW3
+    # inverter headroom for HVAC startup pulses (~4.5 kW) without
+    # forcing grid import mid-dump. Set to 40 by default now — the
+    # user prefers running the EVSE at its wall-plug ceiling and
+    # accepts occasional grid import during HVAC contention. Lower
+    # in .env if that trade-off is wrong for a given site.
+    morning_dump_max_amps: int = Field(default=40, ge=6, le=40)
+    # Pre-sunrise cap (optional). When set, dumping BEFORE sunrise+1h
+    # uses this ceiling instead of `morning_dump_max_amps`. The
+    # rationale: pre-dawn dumping has no PV to offset the EV draw, so
+    # every amp comes from battery+grid — running lower here reduces
+    # HVAC-contention grid import during the coldest morning ticks.
+    # After sunrise+1h PV is producing enough that bumping to the
+    # full ceiling keeps us on-track to hit the floor by dump_end.
+    # None = no gating; use the full ceiling all window (matches
+    # legacy behavior).
+    morning_dump_predawn_max_amps: int | None = Field(default=None, ge=6, le=40)
     # Fraction of the Solcast PV forecast credited toward the dump
     # headroom. At 90%, 90% of the forecast PV between now and the window
     # end is added to the battery SoC headroom; the remaining 10% is held

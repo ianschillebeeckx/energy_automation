@@ -30,6 +30,7 @@ from .config import Settings
 from .forecast import non_ev_load_kwh_in_window, pv_kwh_in_range
 from .policy import Decision
 from .samples import Forecast, LoadStore, SampleStore
+from .solar import sunrise_on as _sunrise_on
 from .state import State
 
 
@@ -230,7 +231,17 @@ class MorningDump:
             )
             return Decision(0, reason, on=False)
 
-        amps = min(raw_amps, s.ev_max_amps, s.morning_dump_max_amps)
+        # Time-varying dump cap: pre-sunrise+1h uses the lower
+        # `morning_dump_predawn_max_amps` (when configured) so we
+        # don't grid-import to serve heavy EV draw before PV is
+        # producing. After sunrise+1h we use the full ceiling.
+        dump_cap = s.morning_dump_max_amps
+        if s.morning_dump_predawn_max_amps is not None:
+            from datetime import timedelta as _td
+            sr = _sunrise_on(ctx.now, s)
+            if sr is not None and ctx.now < sr + _td(hours=1):
+                dump_cap = s.morning_dump_predawn_max_amps
+        amps = min(raw_amps, s.ev_max_amps, dump_cap)
         reason = (
             f"{sunny_prefix}dump {battery_kwh:.1f}+{pv_credit_kwh:.1f}"
             f"-{non_ev_load_kwh:.1f} kWh in {remaining_hr:.2f} h -> {amps} A"

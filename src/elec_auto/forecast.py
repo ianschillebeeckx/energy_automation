@@ -86,14 +86,22 @@ def non_ev_load_kwh_in_window(
     happens to integrate higher than total load (sensor noise).
     """
     yest_lo, yest_hi = start_ts - _DAY_SEC, end_ts - _DAY_SEC
+    # Pull a small bracket on each side so `_integrate_ts_w`'s _interp
+    # calls have neighbors at the window edges. Samples are typically
+    # ~30 s apart, so 5 min is enough to guarantee a bracket without
+    # inflating the query.
+    bracket_sec = 300
     house_pts = [
         (s.ts, s.load_w)
-        for s in samples.read_range(yest_lo, yest_hi)
+        for s in samples.read_range(yest_lo - bracket_sec, yest_hi + bracket_sec)
         if s.load_w is not None and s.load_w >= 0
     ]
     ev_pts = [
         (r.ts, r.watts)
-        for r in loads.read_range(yest_lo, yest_hi, circuit=ev_circuit_name)
+        for r in loads.read_range(
+            yest_lo - bracket_sec, yest_hi + bracket_sec,
+            circuit=ev_circuit_name,
+        )
     ]
     house_kwh = _integrate_ts_w(house_pts, yest_lo, yest_hi)
     ev_kwh = _integrate_ts_w(ev_pts, yest_lo, yest_hi)

@@ -764,8 +764,17 @@ def _control_tick() -> None:
         _last_ev_ts = time.time()
 
     now_ts = int(time.time())
+    # The `- 30*60` low-bracket is deliberate. Solcast periods are
+    # 30-min stamped; without a point before `now`, `_integrate_ts_w`'s
+    # linear-interp helper returns 0 for every step from `now` up to
+    # the first Solcast period (see `_interp` semantics — out-of-range
+    # ts → 0). During the tail of the dump window (say 09:46 with
+    # 10:15 being the only period inside), pv_credit_kwh would
+    # collapse to ~0 even though real forecast PV is several kW.
+    # Fetching one Solcast period before `now` gives every integration
+    # step at least one bracketing neighbor on each side.
     pv_forecasts = _forecast_store().operational_in_range(
-        now_ts, now_ts + 24 * 3600,
+        now_ts - 30 * 60, now_ts + 24 * 3600,
     )
     em_load_w, ev_circuit_w = _em_loads(ev.name if ev else "EV Charger")
     tz = ZoneInfo(settings.timezone)

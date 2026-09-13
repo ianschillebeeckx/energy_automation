@@ -155,6 +155,42 @@ def test_pv_kwh_in_range_skips_periods_outside_data_span() -> None:
     assert pv_kwh_in_range(forecasts, 3000, 4000) == 0.0
 
 
+def test_pv_kwh_in_range_late_window_needs_low_bracket() -> None:
+    """Regression for the 2026-09-13 MorningDump bug: near the tail of
+    the dump window, only ONE Solcast period fell inside the remaining
+    interval. `_interp` returned 0 for every integration step before
+    that one period, so pv_credit collapsed to ~0.
+
+    Fix: the caller passes a wider forecast list (one Solcast period
+    before window_lo) so `_integrate_ts_w` can interpolate at every
+    step. Simulated here with 30-min-spaced periods; the caller in
+    web.py achieves the same by asking `operational_in_range` for
+    [now-30min, now+24h] instead of [now, now+24h].
+    """
+    # Solcast-shaped: 5 kW periods stamped every 30 min, provider
+    # actually returned points bracketing the integration window.
+    period_sec = 1800
+    forecasts = [
+        Forecast(period_ts=t, fetched_at=0, source="test", pv_w_p50=5000)
+        for t in range(0, 3 * period_sec + 1, period_sec)
+    ]
+    # Integrate over a 28-min window inside period 1 → period 2.
+    # Ground truth: 5 kW * (28/60) h = ~2.33 kWh.
+    kwh = pv_kwh_in_range(forecasts, period_sec + 120, 2 * period_sec)
+    assert 2.2 < kwh < 2.4, kwh
+
+    # Same window but with the leading-bracket period stripped (only
+    # points AT and AFTER window_hi remain) — this is what the pre-fix
+    # `operational_in_range(now, now+24h)` query would have returned.
+    # Without the bracket, _interp returns 0 for every step but the
+    # final one → integration collapses to ~0.
+    forecasts_no_bracket = [
+        f for f in forecasts if f.period_ts >= 2 * period_sec
+    ]
+    kwh_bad = pv_kwh_in_range(forecasts_no_bracket, period_sec + 120, 2 * period_sec)
+    assert kwh_bad < 0.3, kwh_bad  # only the last step contributes half
+
+
 # --- load_kwh_in_range -------------------------------------------------------
 
 
