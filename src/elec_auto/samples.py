@@ -12,8 +12,19 @@ of git (`state/` is .gitignored).
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
+
+# Why wrap every `self._connect()` in `contextlib.closing`: the sqlite3
+# Connection's own context manager commits/rollbacks the transaction
+# but does NOT call `.close()`. Combined with `isolation_level=None`
+# (autocommit) the `with conn:` block does nothing useful on exit —
+# the Connection just leaks and is cleaned up by gc whenever CPython
+# gets around to it. On a 42-day-running service, enough leaked
+# connections accumulated that one eventually held a lock and blocked
+# all subsequent writes with "database is locked". `closing(...)`
+# forces `.close()` on exit so FDs and locks are released promptly.
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS samples (
@@ -195,7 +206,7 @@ class SampleStore:
     def insert(self, sample: Sample) -> None:
         def _bool(v: bool | None) -> int | None:
             return None if v is None else int(v)
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO samples
@@ -224,7 +235,7 @@ class SampleStore:
         Used to seed historical theoretical values without clobbering
         actual readings that happen to share a timestamp.
         """
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             conn.execute(
                 """
                 INSERT INTO samples (ts, theoretical_w) VALUES (?, ?)
@@ -234,7 +245,7 @@ class SampleStore:
             )
 
     def read_range(self, start_ts: int, end_ts: int) -> list[Sample]:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             rows = conn.execute(
                 """
                 SELECT ts, solar_w, load_w, battery_w, grid_w, soc_pct,
@@ -324,7 +335,7 @@ class ForecastStore:
         pass, and the new `idx_forecasts_source_fetched` index narrows
         the outer scan.
         """
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             rows = conn.execute(
                 """
                 WITH ranked AS (
@@ -357,7 +368,7 @@ class ForecastStore:
         """
         import time as _t
         now_ts = int(_t.time())
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             row = conn.execute(
                 """
                 SELECT weather, cloud_opacity_pct FROM forecasts
@@ -379,7 +390,7 @@ class ForecastStore:
 
     def last_fetched_at(self, source: str = "solcast") -> int | None:
         """Most recent fetched_at for `source`, or None if no rows."""
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             row = conn.execute(
                 "SELECT MAX(fetched_at) FROM forecasts WHERE source = ?",
                 (source,),
@@ -391,7 +402,7 @@ class ForecastStore:
         rows = [
             tuple(getattr(f, col) for col in _FORECAST_COLS) for f in forecasts
         ]
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             conn.executemany(
                 f"INSERT OR REPLACE INTO forecasts ({', '.join(_FORECAST_COLS)}) "
                 f"VALUES ({placeholders})",
@@ -414,7 +425,7 @@ class ForecastStore:
         fetch (not 09:29, which arrived later).
         """
         select_cols = ", ".join(f"f1.{c}" for c in _FORECAST_COLS)
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             rows = conn.execute(
                 f"""
                 SELECT {select_cols}
@@ -438,7 +449,7 @@ class ForecastStore:
     ) -> list[Forecast]:
         """Return the most recent forecast per period in [start_ts, end_ts]."""
         select_cols = ", ".join(f"f1.{c}" for c in _FORECAST_COLS)
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             rows = conn.execute(
                 f"""
                 SELECT {select_cols}
@@ -501,7 +512,7 @@ class WeatherStore:
         payload = [
             tuple(getattr(w, col) for col in _WEATHER_COLS) for w in rows
         ]
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             conn.executemany(
                 f"INSERT OR REPLACE INTO weather ({', '.join(_WEATHER_COLS)}) "
                 f"VALUES ({placeholders})",
@@ -513,7 +524,7 @@ class WeatherStore:
     ) -> list[Weather]:
         """Most recent weather row per period in [start_ts, end_ts]."""
         select_cols = ", ".join(f"w1.{c}" for c in _WEATHER_COLS)
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             rows = conn.execute(
                 f"""
                 SELECT {select_cols}
@@ -531,7 +542,7 @@ class WeatherStore:
         return [Weather(**dict(zip(_WEATHER_COLS, r))) for r in rows]
 
     def last_fetched_at(self, source: str = "nws") -> int | None:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             row = conn.execute(
                 "SELECT MAX(fetched_at) FROM weather WHERE source = ?",
                 (source,),
@@ -585,7 +596,7 @@ class ObservationStore:
         payload = [
             tuple(getattr(o, col) for col in _OBSERVATION_COLS) for o in rows
         ]
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             conn.executemany(
                 f"INSERT OR REPLACE INTO observations "
                 f"({', '.join(_OBSERVATION_COLS)}) VALUES ({placeholders})",
@@ -606,12 +617,12 @@ class ObservationStore:
             query += " AND station_id = ?"
             args = (start_ts, end_ts, station_id)
         query += " ORDER BY period_ts"
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             rows = conn.execute(query, args).fetchall()
         return [Observation(**dict(zip(_OBSERVATION_COLS, r))) for r in rows]
 
     def last_fetched_at(self, station_id: str) -> int | None:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             row = conn.execute(
                 "SELECT MAX(fetched_at) FROM observations WHERE station_id = ?",
                 (station_id,),
@@ -642,7 +653,7 @@ class LoadStore:
         rows = [(ts, name, float(watts)) for name, watts in circuits.items()]
         if not rows:
             return
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             conn.executemany(
                 "INSERT OR REPLACE INTO loads (ts, circuit, watts) VALUES (?, ?, ?)",
                 rows,
@@ -661,6 +672,6 @@ class LoadStore:
             query += " AND circuit = ?"
             args = (start_ts, end_ts, circuit)
         query += " ORDER BY ts, circuit"
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             rows = conn.execute(query, args).fetchall()
         return [CircuitReading(ts=r[0], circuit=r[1], watts=r[2]) for r in rows]

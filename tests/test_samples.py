@@ -328,3 +328,68 @@ def test_observation_last_fetched_at(tmp_path: Path) -> None:
     ])
     assert os_.last_fetched_at("KSFO") == 1500
     assert os_.last_fetched_at("KOAK") == 9999
+
+
+def test_connections_do_not_leak_across_calls(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Regression for the 2026-10-25 "database is locked" incident.
+
+    Before the fix, `with self._connect() as conn` relied on sqlite3's
+    Connection context manager — which commits/rollbacks but does NOT
+    close. Combined with `isolation_level=None` (autocommit) the whole
+    `with` block did nothing on exit and the Connection just leaked
+    until gc. On a 42-day-old service, enough leaked to deadlock all
+    writes with "database is locked".
+
+    Intercept `sqlite3.connect` so we can inspect every Connection
+    constructed during the writes below, then assert each one is
+    closed (which releases the fd + lock — the thing we actually
+    care about).
+    """
+    import sqlite3
+
+    recorded: list[sqlite3.Connection] = []
+    real_connect = sqlite3.connect
+
+    def _tracking_connect(*args, **kwargs):
+        c = real_connect(*args, **kwargs)
+        recorded.append(c)
+        return c
+
+    monkeypatch.setattr("elec_auto.samples.sqlite3.connect", _tracking_connect)
+
+    db = tmp_path / "leak.db"
+    ss = SampleStore(db)
+    ls = LoadStore(db)
+    fs = ForecastStore(db)
+    ws = WeatherStore(db)
+    os_ = ObservationStore(db)
+    setup_count = len(recorded)
+
+    for i in range(5):
+        ss.insert(Sample(ts=1000 + i, solar_w=0, load_w=0, battery_w=0,
+                         grid_w=0, soc_pct=50, theoretical_w=0))
+        ls.insert_tick(1000 + i, {"test": 10.0})
+        fs.insert_many([Forecast(period_ts=1000 + i, fetched_at=0,
+                                 source="t", pv_w_p50=0)])
+        ws.insert_many([Weather(period_ts=1000 + i, fetched_at=0,
+                                source="t")])
+        os_.insert_many([Observation(period_ts=1000 + i,
+                                     station_id="K", fetched_at=0)])
+
+    per_call = recorded[setup_count:]
+    assert len(per_call) >= 25, (
+        f"expected ≥25 per-call connections (5 iters × 5 stores), got {len(per_call)}"
+    )
+    still_open = []
+    for c in per_call:
+        try:
+            c.execute("SELECT 1")
+            still_open.append(c)
+        except sqlite3.ProgrammingError:
+            pass  # good — closed
+    assert not still_open, (
+        f"{len(still_open)}/{len(per_call)} Connections still have "
+        f"open DB handles — closing(...) is not firing"
+    )
